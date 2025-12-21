@@ -1,0 +1,17 @@
+# Python temporary files
+__pycache__/
+test.py
+*.py[cod]
+
+# Virtual environments (modify if yours is named differently)
+venv/
+env/
+.env
+.venv/
+
+# Environment variables (secrets)
+.env
+
+# IDE settings (optional but recommended)
+.vscode/
+.idea/
