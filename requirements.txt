@@ -3,3 +3,5 @@ numpy<2
 matplotlib
 torch
 torchvision
+gymnasium 
+stable-baselines3
