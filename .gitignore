@@ -3,6 +3,12 @@ __pycache__/
 test.py
 *.py[cod]
 
+# ignore training folders
+models/
+models_rl/
+logs/
+logs_rl/
+
 # Virtual environments (modify if yours is named differently)
 venv/
 env/

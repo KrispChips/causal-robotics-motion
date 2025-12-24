@@ -19,31 +19,31 @@ class CausalPushEnv(gym.Env):
         self.render_mode = render_mode
         self.distribution_mode = distribution_mode
         
-        # --- ACTION SPACE ---
-        # 1D Control: Horizontal Force
-        # Normalized [-1, 1] mapped to [0N, 20N] per PDF [cite: 52]
+        # ACTION SPACE
         self.action_space = spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32)
         
-        # --- OBSERVATION SPACE ---
-        # Current: [x, y, vx, vy, target_dist]
-        # Future proofing: We intentionally EXCLUDE mass/friction to force inference.
+        # OBSERVATION SPACE
         self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(5,), dtype=np.float32)
         
-        # --- PHYSICS CONFIGURATION ---
-        self.target_dist = 0.1  # 10cm target distance [cite: 51]
-        self.success_threshold = 0.02 # +/- 2cm tolerance [cite: 53]
-        self.sim_freq = 240.0   # PyBullet default
-        self.policy_freq = 10.0 # Control frequency (how often agent acts)
+        # PHYSICS CONFIGURATION
+        self.target_dist = 0.1
+        self.success_threshold = 0.02
+        self.sim_freq = 240.0
+        self.policy_freq = 10.0
         self.sim_steps_per_action = int(self.sim_freq / self.policy_freq)
+        
+        # FIX: Add maximum episode length to prevent infinite episodes
+        self.max_episode_steps = 100  # 10 seconds at 10Hz control
+        self.current_step = 0
 
-        # Connect to Physics Server
+        # Connect to Physics Server with Explicit ID
         if render_mode == "human":
             self.client = p.connect(p.GUI)
-            p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0) # Clean UI
+            p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0, physicsClientId=self.client)
         else:
             self.client = p.connect(p.DIRECT)
             
-        p.setAdditionalSearchPath(pybullet_data.getDataPath())
+        p.setAdditionalSearchPath(pybullet_data.getDataPath(), physicsClientId=self.client)
         
         self.block_id = None
         self.plane_id = None
@@ -58,34 +58,26 @@ class CausalPushEnv(gym.Env):
         valid_modes = ['train', 'test_interp', 'test_extrap_high', 'test_extrap_low']
         assert mode in valid_modes, f"Mode must be one of {valid_modes}"
         self.distribution_mode = mode
-        print(f"Environment switched to mode: {mode}")
 
     def _sample_confounders(self):
-        """
-        Samples hidden properties based on the specific research phase [cite: 63-73].
-        """
+        """Samples hidden properties based on the specific research phase"""
         if self.distribution_mode == 'train':
-            # Narrow range: u=[0.3, 0.6], m=[0.8, 1.5] [cite: 64, 65]
             mu = np.random.uniform(0.3, 0.6)
             m = np.random.uniform(0.8, 1.5)
             
         elif self.distribution_mode == 'test_interp':
-            # Middle of range [cite: 67]
             mu = 0.45
             m = 1.2
             
         elif self.distribution_mode == 'test_extrap_high':
-            # High friction, Light mass [cite: 70, 71]
             mu = 0.75
             m = 0.6
             
         elif self.distribution_mode == 'test_extrap_low':
-            # Low friction, Heavy mass [cite: 72, 73]
             mu = 0.25
             m = 1.9
             
         else:
-            # Fallback (Uniform full range) [cite: 45]
             mu = np.random.uniform(0.2, 0.8)
             m = np.random.uniform(0.5, 2.0)
             
@@ -93,100 +85,117 @@ class CausalPushEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        p.resetSimulation()
-        p.setGravity(0, 0, -9.8)
+        
+        # FIX: Reset step counter
+        self.current_step = 0
+        
+        # Reset simulation
+        p.resetSimulation(physicsClientId=self.client)
+        p.setGravity(0, 0, -9.8, physicsClientId=self.client)
         
         # 1. Load Plane
-        self.plane_id = p.loadURDF("plane.urdf")
+        self.plane_id = p.loadURDF("plane.urdf", physicsClientId=self.client)
         
-        # 2. Create Block Procedurally (Exact 10cm cube)
-        # halfExtents is half the side length, so 0.05 -> 10cm size
-        col_shape = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.05, 0.05, 0.05])
-        vis_shape = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.05, 0.05, 0.05], rgbaColor=[0.2, 0.6, 0.8, 1])
-        
-        start_pos = [0, 0, 0.05] # Sitting on ground
-        self.block_id = p.createMultiBody(
-            baseMass=1.0, # Placeholder, updated below
-            baseCollisionShapeIndex=col_shape,
-            baseVisualShapeIndex=vis_shape,
-            basePosition=start_pos
+        # 2. Create Block Procedurally (FIX: Added physicsClientId to shape creation)
+        col_shape = p.createCollisionShape(
+            p.GEOM_BOX, 
+            halfExtents=[0.05, 0.05, 0.05], 
+            physicsClientId=self.client
+        )
+        vis_shape = p.createVisualShape(
+            p.GEOM_BOX, 
+            halfExtents=[0.05, 0.05, 0.05], 
+            rgbaColor=[0.2, 0.6, 0.8, 1], 
+            physicsClientId=self.client
         )
         
-        # 3. Create Target Visualization (Phantom, no collision)
-        t_vis_shape = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.05, 0.05, 0.001], rgbaColor=[0, 1, 0, 0.4])
+        start_pos = [0, 0, 0.05] 
+        self.block_id = p.createMultiBody(
+            baseMass=1.0, 
+            baseCollisionShapeIndex=col_shape,
+            baseVisualShapeIndex=vis_shape,
+            basePosition=start_pos,
+            physicsClientId=self.client
+        )
+        
+        # 3. Create Target Visualization (FIX: Added physicsClientId)
+        t_vis_shape = p.createVisualShape(
+            p.GEOM_BOX, 
+            halfExtents=[0.05, 0.05, 0.001], 
+            rgbaColor=[0, 1, 0, 0.4], 
+            physicsClientId=self.client
+        )
         self.target_visual_id = p.createMultiBody(
             baseVisualShapeIndex=t_vis_shape,
-            basePosition=[self.target_dist, 0, 0.001]
+            basePosition=[self.target_dist, 0, 0.001],
+            physicsClientId=self.client
         )
 
         # 4. Apply Hidden Confounders
         self.current_mu, self.current_m = self._sample_confounders()
         
-        # Apply to Block
-        p.changeDynamics(self.block_id, -1, mass=self.current_m)
-        p.changeDynamics(self.block_id, -1, lateralFriction=self.current_mu)
-        # Apply to Floor (friction interaction is product of both)
-        p.changeDynamics(self.plane_id, -1, lateralFriction=1.0) 
+        p.changeDynamics(self.block_id, -1, mass=self.current_m, physicsClientId=self.client)
+        p.changeDynamics(self.block_id, -1, lateralFriction=self.current_mu, physicsClientId=self.client)
+        p.changeDynamics(self.plane_id, -1, lateralFriction=1.0, physicsClientId=self.client) 
         
-        # Reset Camera if rendering
         if self.render_mode == "human":
-            p.resetDebugVisualizerCamera(cameraDistance=0.5, cameraYaw=0, cameraPitch=-40, cameraTargetPosition=[0.05, 0, 0])
+            p.resetDebugVisualizerCamera(
+                cameraDistance=0.5, 
+                cameraYaw=0, 
+                cameraPitch=-40, 
+                cameraTargetPosition=[0.05, 0, 0], 
+                physicsClientId=self.client
+            )
 
         return self._get_obs(), {}
 
     def step(self, action):
-        # 1. Convert Action to Force
-        # Action is [-1, 1], Force is [0, 20N]
-        # We clip to ensure safety, though PPO usually respects bounds
-        act = np.clip(action[0], -1.0, 1.0)
-        force_mag = (act + 1.0) * 10.0 # Map -1->0, 1->20 [cite: 52]
+        # FIX: Increment step counter
+        self.current_step += 1
         
-        # 2. Apply Force and Step Simulation
-        # We apply the force continuously over the duration of the 'step'
+        act = np.clip(action[0], -1.0, 1.0)
+        force_mag = (act + 1.0) * 10.0 
+        
         for _ in range(self.sim_steps_per_action):
             p.applyExternalForce(
                 self.block_id, 
                 -1, 
                 forceObj=[force_mag, 0, 0], 
-                posObj=[0, 0, 0], # Center of mass
-                flags=p.WORLD_FRAME
+                posObj=[0, 0, 0], 
+                flags=p.WORLD_FRAME,
+                physicsClientId=self.client
             )
-            p.stepSimulation()
+            p.stepSimulation(physicsClientId=self.client)
             if self.render_mode == "human":
                 time.sleep(1./self.sim_freq)
                 
-        # 3. Get Observation
         obs = self._get_obs()
         block_x = obs[0]
         
-        # 4. Calculate Metrics
         dist_to_target = abs(block_x - self.target_dist)
         success = dist_to_target < self.success_threshold
         
-        # 5. Reward Function
-        # Dense reward for distance, sparse bonus for success
         reward = -dist_to_target 
         if success:
             reward += 10.0
             
-        # 6. Termination
+        # FIX: Terminate on success OR when max steps reached
         terminated = bool(success)
-        truncated = False # Handled by TimeLimit wrapper in main script
+        truncated = self.current_step >= self.max_episode_steps
         
-        # Info includes Ground Truth for evaluation/debugging
         info = {
             "true_friction": self.current_mu,
             "true_mass": self.current_m,
-            "is_success": success
+            "is_success": success,
+            "TimeLimit.truncated": truncated  # Helps with logging
         }
         
         return obs, reward, terminated, truncated, info
 
     def _get_obs(self):
-        pos, _ = p.getBasePositionAndOrientation(self.block_id)
-        lin_vel, _ = p.getBaseVelocity(self.block_id)
+        pos, _ = p.getBasePositionAndOrientation(self.block_id, physicsClientId=self.client)
+        lin_vel, _ = p.getBaseVelocity(self.block_id, physicsClientId=self.client)
         
-        # State: [x, y, vx, vy, target_dist]
         return np.array([
             pos[0], 
             pos[1], 
@@ -196,4 +205,5 @@ class CausalPushEnv(gym.Env):
         ], dtype=np.float32)
 
     def close(self):
-        p.disconnect()
+        if hasattr(self, 'client'):
+            p.disconnect(self.client)
