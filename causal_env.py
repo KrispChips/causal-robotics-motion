@@ -32,7 +32,7 @@ class CausalPushEnv(gym.Env):
         self.policy_freq = 10.0
         self.sim_steps_per_action = int(self.sim_freq / self.policy_freq)
         
-        # FIX: Add maximum episode length to prevent infinite episodes
+        # Add maximum episode length to prevent infinite episodes
         self.max_episode_steps = 100  # 10 seconds at 10Hz control
         self.current_step = 0
 
@@ -86,7 +86,7 @@ class CausalPushEnv(gym.Env):
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
         
-        # FIX: Reset step counter
+        # Reset step counter
         self.current_step = 0
         
         # Reset simulation
@@ -96,7 +96,7 @@ class CausalPushEnv(gym.Env):
         # 1. Load Plane
         self.plane_id = p.loadURDF("plane.urdf", physicsClientId=self.client)
         
-        # 2. Create Block Procedurally (FIX: Added physicsClientId to shape creation)
+        # 2. Create Block Procedurally
         col_shape = p.createCollisionShape(
             p.GEOM_BOX, 
             halfExtents=[0.05, 0.05, 0.05], 
@@ -118,7 +118,7 @@ class CausalPushEnv(gym.Env):
             physicsClientId=self.client
         )
         
-        # 3. Create Target Visualization (FIX: Added physicsClientId)
+        # 3. Create Target Visualization
         t_vis_shape = p.createVisualShape(
             p.GEOM_BOX, 
             halfExtents=[0.05, 0.05, 0.001], 
@@ -150,11 +150,23 @@ class CausalPushEnv(gym.Env):
         return self._get_obs(), {}
 
     def step(self, action):
-        # FIX: Increment step counter
+        # Increment step counter
         self.current_step += 1
         
-        act = np.clip(action[0], -1.0, 1.0)
-        force_mag = (act + 1.0) * 10.0 
+        # FIX 1: Handle both array and scalar actions from vectorized envs
+        if isinstance(action, np.ndarray):
+            if action.ndim == 0:  # scalar array
+                act = float(action)
+            else:  # 1D array
+                act = action[0]
+        else:
+            act = action
+        
+        act = np.clip(act, -1.0, 1.0)
+        
+        # FIX 2: Correct force mapping - higher action should mean higher force
+        # Map [-1, 1] to [0N, 20N]
+        force_mag = (act + 1.0) * 10.0  # -1 -> 0N, 0 -> 10N, +1 -> 20N
         
         for _ in range(self.sim_steps_per_action):
             p.applyExternalForce(
@@ -175,11 +187,12 @@ class CausalPushEnv(gym.Env):
         dist_to_target = abs(block_x - self.target_dist)
         success = dist_to_target < self.success_threshold
         
+        # Reward: negative distance (want to minimize) + bonus for success
         reward = -dist_to_target 
         if success:
             reward += 10.0
             
-        # FIX: Terminate on success OR when max steps reached
+        # Terminate on success OR when max steps reached
         terminated = bool(success)
         truncated = self.current_step >= self.max_episode_steps
         
@@ -187,7 +200,7 @@ class CausalPushEnv(gym.Env):
             "true_friction": self.current_mu,
             "true_mass": self.current_m,
             "is_success": success,
-            "TimeLimit.truncated": truncated  # Helps with logging
+            "TimeLimit.truncated": truncated
         }
         
         return obs, reward, terminated, truncated, info
