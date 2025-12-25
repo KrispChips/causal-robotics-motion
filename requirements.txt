@@ -5,3 +5,4 @@ torch
 torchvision
 gymnasium 
 stable-baselines3
+scipy
