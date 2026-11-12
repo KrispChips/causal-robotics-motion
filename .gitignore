@@ -7,7 +7,8 @@ test.py
 # ignore training folders
 logs_realistic/
 models_realistic/
-
+logs_realistic_old_dec2025/
+models_realistic_old_dec2025/
 
 # Virtual environments (modify if yours is named differently)
 venv/
@@ -21,3 +22,6 @@ env/
 # IDE settings (optional but recommended)
 .vscode/
 .idea/
+
+# ignore pdf plan
+Causal Robotics Personal Project (1).pdf
