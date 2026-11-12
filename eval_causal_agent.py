@@ -21,13 +21,15 @@ def evaluate_causal_agent(env_mode, n_episodes=50, verbose=True):
         Dictionary with success rate, inference accuracy, etc.
     """
     env = RealisticCausalPushEnv(render_mode=None, distribution_mode=env_mode)
-    policy = CausalDiscoveryPolicy(exploration_steps=5)  # UPDATED: 3 → 5 for better inference
+    policy = CausalDiscoveryPolicy()
     
     successes = []
     friction_errors = []
     mass_errors = []
     final_distances = []
     all_beliefs = []
+    true_frictions = []  # FIXED: Track actual ground truth
+    true_masses = []     # FIXED: Track actual ground truth
     
     for episode in range(n_episodes):
         obs, _ = env.reset()
@@ -45,6 +47,10 @@ def evaluate_causal_agent(env_mode, n_episodes=50, verbose=True):
         # Record results
         successes.append(info['is_success'])
         final_distances.append(info['final_distance'])
+        
+        # FIXED: Store ground truth values
+        true_frictions.append(info['true_base_friction'])
+        true_masses.append(info['true_mass'])
         
         # Get final beliefs
         beliefs = policy.agent.get_beliefs()
@@ -72,7 +78,10 @@ def evaluate_causal_agent(env_mode, n_episodes=50, verbose=True):
         'mean_mass_error': np.mean(mass_errors),
         'mean_final_distance': np.mean(final_distances),
         'std_final_distance': np.std(final_distances),
-        'beliefs': all_beliefs
+        'beliefs': all_beliefs,
+        'true_frictions': true_frictions,  # FIXED: Include actual values
+        'true_masses': true_masses,        # FIXED: Include actual values
+        'successes': successes              # FIXED: Include per-episode success
     }
 
 def evaluate_baseline_rl(env_mode, model_path, n_episodes=50):
@@ -216,7 +225,7 @@ def plot_comparison(causal_results, baseline_results, distributions):
     axes[0,1].legend()
     axes[0,1].grid(True, alpha=0.3)
     
-    # Plot 3: Final Distance Distribution
+    # Plot 3: Inferred Friction Distribution
     for i, mode in enumerate(modes):
         distances = [b['friction_mean'] for b in causal_results[mode]['beliefs']]
         axes[1,0].scatter([i]*len(distances), distances, alpha=0.3, s=20)
@@ -227,35 +236,23 @@ def plot_comparison(causal_results, baseline_results, distributions):
     axes[1,0].set_xticklabels(['Train', 'Interp', 'High μ', 'Low μ', 'Adv'], rotation=15)
     axes[1,0].grid(True, alpha=0.3)
     
-    # Plot 4: Success Rate vs True Friction
-    all_friction_true = []
-    all_success = []
-    all_mode_colors = []
+    # Plot 4: Success Rate vs True Friction - FIXED TO USE ACTUAL VALUES
     colors = ['green', 'blue', 'red', 'orange', 'purple']
     
     for i, mode in enumerate(modes):
-        # Approximate true friction for each distribution
-        if mode == 'train':
-            true_frictions = np.random.uniform(0.22, 0.28, 50)
-        elif mode == 'test_interp':
-            true_frictions = np.ones(50) * 0.25
-        elif mode == 'test_extrap_high':
-            true_frictions = np.ones(50) * 0.35
-        elif mode == 'test_extrap_low':
-            true_frictions = np.ones(50) * 0.15
-        else:  # adversarial
-            true_frictions = np.ones(50) * 0.30
+        # FIXED: Use actual ground truth friction values
+        true_frictions = causal_results[mode]['true_frictions']
+        successes = causal_results[mode]['successes']
         
-        # Success is binary, jitter for visibility
-        successes = np.random.binomial(1, causal_results[mode]['success_rate'], 50)
-        successes_jittered = successes + np.random.normal(0, 0.02, 50)
+        # Jitter success values for visibility
+        successes_jittered = np.array(successes) + np.random.normal(0, 0.02, len(successes))
         
         axes[1,1].scatter(true_frictions, successes_jittered, 
                          alpha=0.5, color=colors[i], label=mode, s=30)
     
     axes[1,1].set_xlabel('True Friction Coefficient')
     axes[1,1].set_ylabel('Success (0/1)')
-    axes[1,1].set_title('Causal Agent: Success vs Friction')
+    axes[1,1].set_title('Causal Agent: Success vs True Friction')
     axes[1,1].legend(fontsize=8)
     axes[1,1].set_ylim(-0.1, 1.1)
     axes[1,1].grid(True, alpha=0.3)

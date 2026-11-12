@@ -4,12 +4,10 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
-from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback
+from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, BaseCallback
 from stable_baselines3.common.monitor import Monitor
 
-# Import the new realistic environment
-# Make sure this file is saved as 'realistic_causal_env.py'
-from realistic_causal_env import RealisticCausalPushEnv
+from realistic_causal_env import RealisticCausalPushEnv, FORCE_MIN, FORCE_MAX
 
 def make_env(rank, mode='train'):
     """Create environment factory"""
@@ -22,10 +20,46 @@ def make_env(rank, mode='train'):
         return Monitor(env)
     return _init
 
+class DetailedLoggingCallback(BaseCallback):
+    """
+    Custom callback to log detailed training progress
+    """
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
+        self.episode_rewards = []
+        self.episode_lengths = []
+        self.episode_successes = []
+        
+    def _on_step(self) -> bool:
+        # Check if episode ended
+        for idx, done in enumerate(self.locals['dones']):
+            if done:
+                # Get episode info
+                info = self.locals['infos'][idx]
+                
+                if 'episode' in info:
+                    self.episode_rewards.append(info['episode']['r'])
+                    self.episode_lengths.append(info['episode']['l'])
+                
+                # Track success if available
+                if 'is_success' in info:
+                    self.episode_successes.append(info['is_success'])
+                
+                # Print progress every 10 episodes
+                if len(self.episode_rewards) % 10 == 0:
+                    recent_rewards = self.episode_rewards[-10:]
+                    recent_successes = self.episode_successes[-10:] if self.episode_successes else []
+                    
+                    print(f"\n[Episode {len(self.episode_rewards)}]")
+                    print(f"  Mean reward (last 10): {np.mean(recent_rewards):.2f}")
+                    if recent_successes:
+                        print(f"  Success rate (last 10): {np.mean(recent_successes)*100:.1f}%")
+        
+        return True
+
 def train_baseline():
     """
-    Train baseline RL agent (PPO) on training distribution.
-    This will establish what standard RL can achieve.
+    IMPROVED: Train baseline RL agent with better monitoring
     """
     
     log_dir = "logs_realistic/"
@@ -34,11 +68,11 @@ def train_baseline():
     os.makedirs(models_dir, exist_ok=True)
     
     print("="*70)
-    print("TRAINING BASELINE RL AGENT")
+    print("TRAINING BASELINE RL AGENT (IMPROVED)")
     print("="*70)
-    print("Environment: Realistic Causal Push")
-    print("Confounders: Mass, Base Friction, Surface Roughness")
-    print("Distribution: Training (narrow range)")
+    print("Environment: Realistic Causal Push (FIXED)")
+    print("Success threshold: ±1.0cm")
+    print(f"Force range: [{FORCE_MIN}, {FORCE_MAX}]N")
     print("="*70)
     
     # Create training environment
@@ -53,7 +87,7 @@ def train_baseline():
         best_model_save_path=models_dir,
         log_path=log_dir,
         eval_freq=5000,
-        n_eval_episodes=10,
+        n_eval_episodes=20,  # INCREASED from 10 for better estimates
         deterministic=True,
         render=False,
         verbose=1
@@ -66,7 +100,9 @@ def train_baseline():
         verbose=1
     )
     
-    # Create PPO agent
+    detailed_callback = DetailedLoggingCallback(verbose=1)
+    
+    # Create PPO agent with IMPROVED hyperparameters
     model = PPO(
         "MlpPolicy",
         env,
@@ -78,7 +114,7 @@ def train_baseline():
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
-        ent_coef=0.01,
+        ent_coef=0.01,  # Encourage exploration
         vf_coef=0.5,
         max_grad_norm=0.5,
         tensorboard_log=log_dir,
@@ -86,13 +122,18 @@ def train_baseline():
     )
     
     print("\nStarting training...")
-    print("Total timesteps: 300,000")
-    print("Expected time: ~30-45 minutes on CPU\n")
+    print("Total timesteps: 500,000")  # INCREASED from 300K
+    print("Expected time: ~45-60 minutes on CPU")
+    print("\nMonitoring:")
+    print("  - Episode rewards and success rate will be logged")
+    print("  - Best model saved based on mean reward")
+    print("  - Checkpoints saved every 10K steps")
+    print()
     
     try:
         model.learn(
-            total_timesteps=300000,
-            callback=[eval_callback, checkpoint_callback],
+            total_timesteps=500000,  # INCREASED from 300K
+            callback=[eval_callback, checkpoint_callback, detailed_callback],
             progress_bar=True
         )
         
@@ -102,10 +143,45 @@ def train_baseline():
         print("TRAINING COMPLETE!")
         print("="*70)
         print(f"Best model saved: {models_dir}/best_model.zip")
-        print(f"Checkpoints saved: {models_dir}/ppo_realistic_*_steps.zip")
-        print("\nNext steps:")
-        print("  1. Run: python evaluate_realistic.py")
-        print("  2. This will test on all distributions and show distribution shift")
+        print(f"Final model saved: {models_dir}/final_model.zip")
+        print(f"Checkpoints: {models_dir}/ppo_realistic_*_steps.zip")
+        
+        # Quick evaluation on final model
+        print("\n" + "="*70)
+        print("FINAL MODEL EVALUATION (Training Distribution)")
+        print("="*70)
+        
+        test_env = RealisticCausalPushEnv(render_mode=None, distribution_mode='train')
+        successes = []
+        distances = []
+        
+        for _ in range(20):
+            obs, _ = test_env.reset()
+            done = False
+            while not done:
+                action, _ = model.predict(obs, deterministic=True)
+                obs, reward, terminated, truncated, info = test_env.step(action)
+                done = terminated or truncated
+            
+            successes.append(info['is_success'])
+            distances.append(info['final_distance'] * 100)
+        
+        test_env.close()
+        
+        print(f"\nResults (20 episodes):")
+        print(f"  Success rate: {np.mean(successes)*100:.1f}%")
+        print(f"  Mean distance: {np.mean(distances):.2f}cm")
+        print(f"  Std distance: {np.std(distances):.2f}cm")
+        
+        if np.mean(successes) < 0.5:
+            print("\n⚠️  WARNING: Success rate < 50% on training distribution!")
+            print("   Consider:")
+            print("   - Training longer (increase timesteps)")
+            print("   - Adjusting reward function")
+            print("   - Checking if task is achievable")
+        else:
+            print("\n✓ Model learned successfully!")
+            print("  Next: python eval_causal_agent.py")
         
     except KeyboardInterrupt:
         print("\n--- Training interrupted ---")

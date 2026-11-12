@@ -1,331 +1,225 @@
 """
-Bayesian Causal Discovery Agent
+Bayesian Causal Agent
 
-Key Idea: Infer hidden confounders (friction, mass) from interaction dynamics,
-then use physics model to choose optimal force.
+Treats the block's friction (mu) and mass (m) as hidden confounders of the
+force -> motion relationship and infers them from interaction:
 
-This beats standard RL by explicitly reasoning about causation.
+    mu ──┐
+         ├──> block motion (x, v)
+    m  ──┘        ^
+                  │
+            applied force F   (the agent's intervention)
+
+Method
+------
+* Structural model: Coulomb friction, integrated at the simulator's 240 Hz
+  substep rate,  dv/dt = (F - mu*m*g)/m  with v clamped at 0 (friction can
+  stop the block but never push it backwards). Validated against PyBullet:
+  ~0.15 mm position / ~3 mm/s velocity error per 0.1 s control step.
+* Inference: exact Bayesian update on a 2-D grid over (mu, m). Parameters
+  are constant within an episode, so a grid avoids the degeneracy and
+  resampling/jitter artefacts a particle filter has for static parameters.
+  Each control step contributes the likelihood of the observed velocity
+  given the *observed* starting state (x, v) -- not a from-rest rollout.
+  "Block did not move under force F" is an observation like any other:
+  every (mu, m) with mu*m*g < F predicts motion and is penalised.
+* Identifiability: pushing gives  a = F/m - mu*g,  coasting gives  a = -mu*g.
+  Both phases happen in every episode, so mu and m are separable.
+* Control: at each step, choose the force for this step (then coast with
+  F = 0) that minimises the posterior-expected squared error of the block's
+  final position. Re-planned every step as the posterior sharpens.
 """
 
 import numpy as np
-from scipy.stats import beta, norm
-from scipy.optimize import minimize
 import matplotlib.pyplot as plt
 
+from realistic_causal_env import FORCE_MIN, FORCE_MAX, force_to_action
+
+G = 9.8
+SIM_DT = 1.0 / 240.0
+SUBSTEPS = 24  # 240 Hz physics / 10 Hz control
+
+
+def simulate_step(x, v, force, mu, mass, substeps=SUBSTEPS, dt=SIM_DT):
+    """Advance one control step under constant force. Vectorised over any
+    broadcastable combination of x, v, force, mu, mass (numpy arrays)."""
+    decel_friction = mu * G
+    for _ in range(substeps):
+        v = np.maximum(v + (force / mass - decel_friction) * dt, 0.0)
+        x = x + v * dt
+    return x, v
+
+
 class BayesianCausalAgent:
-    """
-    Agent that infers friction and mass through Bayesian updating,
-    then uses physics model to choose actions.
-    """
-    
-    def __init__(self, 
-                 friction_prior=(2, 2),      # Beta distribution parameters
-                 mass_prior=(1.0, 0.3),      # Normal distribution (mean, std)
-                 n_particles=1000):          # Particle filter resolution
-        
-        # Prior beliefs about confounders
-        self.friction_prior = friction_prior
-        self.mass_prior = mass_prior
-        self.n_particles = n_particles
-        
-        # Initialize particle filter for beliefs
+    """Grid-based Bayesian posterior over (friction, mass) + planner."""
+
+    def __init__(self,
+                 friction_range=(0.05, 0.80),
+                 mass_range=(0.3, 2.5),
+                 grid_size=(120, 120),
+                 velocity_noise_std=0.015,
+                 n_plan_samples=256,
+                 n_candidate_forces=81,
+                 rng=None):
+        """
+        Prior: uniform over a box that covers every train/test setting with
+        margin (the PDF's full physical range is mu in [0.2,0.8], m in
+        [0.5,2.0]). The agent is NOT told the training distribution.
+
+        velocity_noise_std: per-step observation noise on velocity (m/s).
+        Covers model error (~0.003) plus the env's per-step friction
+        resampling, sigma_mu = 0.02*roughness -> sigma_v ~ 0.014 at r = 0.7.
+        """
+        self.rng = rng if rng is not None else np.random.default_rng()
+        self.friction_values = np.linspace(*friction_range, grid_size[0])
+        self.mass_values = np.linspace(*mass_range, grid_size[1])
+        mu_grid, m_grid = np.meshgrid(self.friction_values, self.mass_values,
+                                      indexing='ij')
+        self.mu_flat = mu_grid.ravel()
+        self.m_flat = m_grid.ravel()
+        self.velocity_noise_std = velocity_noise_std
+        self.n_plan_samples = n_plan_samples
+        self.candidate_forces = np.linspace(FORCE_MIN, FORCE_MAX, n_candidate_forces)
         self.reset_beliefs()
-        
-        # Physics constants
-        self.g = 9.8  # gravity
-        self.dt = 0.1  # timestep (10Hz control)
-        
-        # Interaction history
-        self.interaction_history = []
-    
+
+    # ------------------------------------------------------------------ beliefs
     def reset_beliefs(self):
-        """Reset beliefs to prior for new episode"""
-        # Sample particles from prior
-        # Friction: Beta(2,2) scaled to [0.15, 0.35]
-        friction_samples = beta.rvs(self.friction_prior[0], self.friction_prior[1], 
-                                    size=self.n_particles)
-        self.friction_particles = 0.15 + friction_samples * 0.20  # Scale to [0.15, 0.35]
-        
-        # Mass: Normal(1.0, 0.3) clipped to [0.6, 1.4]
-        self.mass_particles = norm.rvs(self.mass_prior[0], self.mass_prior[1],
-                                      size=self.n_particles)
-        self.mass_particles = np.clip(self.mass_particles, 0.6, 1.4)
-        
-        # Equal weights initially
-        self.weights = np.ones(self.n_particles) / self.n_particles
-        
-        # Clear history
+        self.log_post = np.zeros_like(self.mu_flat)  # uniform prior
         self.interaction_history = []
-    
-    def predict_distance(self, force, friction, mass, n_steps=20):
-        """
-        Simplified physics model: predict how far block moves
-        
-        CALIBRATED to match environment dynamics
-        """
-        position = 0.0
-        velocity = 0.0
-        
-        # Physics parameters (tuned to match environment)
-        damping = 0.98  # Matches environment
-        dt = 1.0 / 10.0  # 10Hz control frequency
-        
-        for step in range(n_steps):
-            # Friction force (static + kinetic combined)
-            f_friction = friction * mass * self.g
-            
-            # Net force (can't pull backward)
-            if force > f_friction:
-                f_net = force - f_friction
-            else:
-                f_net = 0.0
-                velocity *= 0.5  # Rapid decay if not enough force
-            
-            # Acceleration
-            accel = f_net / mass if mass > 0 else 0
-            
-            # Update velocity (with damping)
-            velocity += accel * dt
-            velocity *= damping
-            
-            # Update position
-            position += velocity * dt
-            
-            # Stop if velocity is negligible
-            if abs(velocity) < 0.001 and step > 5:
-                break
-        
-        return position
-    
-    def likelihood(self, observed_distance, force, friction, mass, n_steps):
-        """
-        Compute likelihood: P(observed_distance | force, friction, mass)
-        
-        Uses Gaussian likelihood around predicted distance
-        """
-        predicted_distance = self.predict_distance(force, friction, mass, n_steps)
-        
-        # Likelihood is Gaussian with some noise (accounts for roughness)
-        noise_std = 0.02  # 2cm standard deviation
-        likelihood = norm.pdf(observed_distance, predicted_distance, noise_std)
-        
-        return likelihood
-    
-    def update_beliefs(self, force_applied, observed_distance, n_steps=20):
-        """
-        Bayesian update: P(μ,m | observation) ∝ P(observation | μ,m,force) × P(μ,m)
-        
-        Uses particle filter for tractability
-        """
-        # Compute likelihood for each particle
-        likelihoods = np.array([
-            self.likelihood(observed_distance, force_applied, 
-                          self.friction_particles[i], self.mass_particles[i], n_steps)
-            for i in range(self.n_particles)
-        ])
-        
-        # Update weights: posterior ∝ prior × likelihood
-        self.weights *= likelihoods
-        
-        # Normalize
-        if self.weights.sum() > 0:
-            self.weights /= self.weights.sum()
-        else:
-            # If all weights are 0, reset to uniform
-            self.weights = np.ones(self.n_particles) / self.n_particles
-        
-        # Resample if effective sample size is low
-        n_eff = 1.0 / np.sum(self.weights ** 2)
-        if n_eff < self.n_particles / 2:
-            self.resample_particles()
-        
-        # Store interaction
+
+    @property
+    def weights(self):
+        w = np.exp(self.log_post - self.log_post.max())
+        return w / w.sum()
+
+    def update_beliefs(self, x_before, v_before, force_applied, x_after, v_after):
+        """Bayes rule for one control step:
+        log P(mu,m | data) += log N(v_after; v_pred(mu,m), sigma_v^2)."""
+        _, v_pred = simulate_step(x_before, v_before, force_applied,
+                                  self.mu_flat, self.m_flat)
+        resid = (v_after - v_pred) / self.velocity_noise_std
+        self.log_post += -0.5 * resid ** 2
+        self.log_post -= self.log_post.max()  # keep numerically bounded
         self.interaction_history.append({
-            'force': force_applied,
-            'distance': observed_distance,
-            'n_steps': n_steps
+            'x_before': x_before, 'v_before': v_before, 'force': force_applied,
+            'x_after': x_after, 'v_after': v_after,
         })
-    
-    def resample_particles(self):
-        """Resample particles according to weights (particle filter)"""
-        indices = np.random.choice(self.n_particles, size=self.n_particles, 
-                                  p=self.weights)
-        self.friction_particles = self.friction_particles[indices]
-        self.mass_particles = self.mass_particles[indices]
-        
-        # Add small noise to avoid particle depletion
-        self.friction_particles += np.random.normal(0, 0.01, self.n_particles)
-        self.friction_particles = np.clip(self.friction_particles, 0.15, 0.35)
-        
-        self.mass_particles += np.random.normal(0, 0.05, self.n_particles)
-        self.mass_particles = np.clip(self.mass_particles, 0.6, 1.4)
-        
-        # Reset weights to uniform
-        self.weights = np.ones(self.n_particles) / self.n_particles
-    
+
     def get_beliefs(self):
-        """Get current belief estimates (weighted mean)"""
-        friction_estimate = np.average(self.friction_particles, weights=self.weights)
-        mass_estimate = np.average(self.mass_particles, weights=self.weights)
-        
-        # Also compute uncertainty (weighted std)
-        friction_std = np.sqrt(np.average(
-            (self.friction_particles - friction_estimate)**2, weights=self.weights))
-        mass_std = np.sqrt(np.average(
-            (self.mass_particles - mass_estimate)**2, weights=self.weights))
-        
+        w = self.weights
+        mu_mean = np.sum(w * self.mu_flat)
+        m_mean = np.sum(w * self.m_flat)
+        mu_std = np.sqrt(np.sum(w * (self.mu_flat - mu_mean) ** 2))
+        m_std = np.sqrt(np.sum(w * (self.m_flat - m_mean) ** 2))
+        # Friction force mu*m*g is often pinned down before mu and m separate
+        fric_force = self.mu_flat * self.m_flat * G
+        ff_mean = np.sum(w * fric_force)
+        ff_std = np.sqrt(np.sum(w * (fric_force - ff_mean) ** 2))
+        nz = w[w > 0]
         return {
-            'friction_mean': friction_estimate,
-            'friction_std': friction_std,
-            'mass_mean': mass_estimate,
-            'mass_std': mass_std
+            'friction_mean': mu_mean, 'friction_std': mu_std,
+            'mass_mean': m_mean, 'mass_std': m_std,
+            'friction_force_mean': ff_mean, 'friction_force_std': ff_std,
+            'entropy': -np.sum(nz * np.log(nz)),
         }
-    
-    def choose_force(self, target_distance=0.1, n_steps=20, mode='exploit'):
+
+    def sample_parameters(self, n):
+        idx = self.rng.choice(self.mu_flat.size, size=n, p=self.weights)
+        return self.mu_flat[idx], self.m_flat[idx]
+
+    # ----------------------------------------------------------------- planning
+    def predict_final_state(self, x, v, first_force, mu, mass, n_steps):
+        """Apply first_force for one step, then coast (F=0) for the rest."""
+        x, v = simulate_step(x, v, first_force, mu, mass)
+        for _ in range(n_steps - 1):
+            x, v = simulate_step(x, v, 0.0, mu, mass)
+        return x, v
+
+    def choose_force(self, x, v, target, n_steps_remaining,
+                     speed_weight=0.1, overshoot_weight=10.0,
+                     recourse_steps=3):
+        """Force minimising the posterior-expected cost of the final state.
+
+        Cost is asymmetric while there is time left to correct: the agent can
+        only push, so undershoot is recoverable on a later step (with a
+        sharper posterior) but overshoot never is. Weighting overshoot more
+        makes early pushes cautious while mu and m are still uncertain.
         """
-        Choose force to apply
-        
-        IMPROVED: Better optimization with bounds checking
-        """
-        beliefs = self.get_beliefs()
-        friction_est = beliefs['friction_mean']
-        mass_est = beliefs['mass_mean']
-        
-        if mode == 'explore':
-            # Exploration: systematic force variation
-            if len(self.interaction_history) == 0:
-                return 2.5  # Start with moderate force
-            elif len(self.interaction_history) == 1:
-                return 4.0  # Try higher force
-            elif len(self.interaction_history) == 2:
-                return 1.5  # Try lower force
-            else:
-                mode = 'exploit'  # Switch to exploitation
-        
-        if mode == 'exploit':
-            # Exploitation: Use grid search over reasonable force range
-            # This is more robust than gradient-based optimization
-            
-            forces_to_try = np.linspace(0.5, 5.5, 50)
-            best_force = forces_to_try[0]
-            best_error = float('inf')
-            
-            for f in forces_to_try:
-                predicted = self.predict_distance(f, friction_est, mass_est, n_steps)
-                error = abs(predicted - target_distance)
-                
-                if error < best_error:
-                    best_error = error
-                    best_force = f
-            
-            return best_force
-    
-    def visualize_beliefs(self):
-        """Plot current beliefs about friction and mass"""
-        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-        
-        # Friction distribution
-        axes[0].hist(self.friction_particles, weights=self.weights, bins=50, 
-                    alpha=0.7, edgecolor='black')
-        beliefs = self.get_beliefs()
-        axes[0].axvline(beliefs['friction_mean'], color='red', linestyle='--', 
-                       label=f"Mean: {beliefs['friction_mean']:.3f}")
-        axes[0].set_xlabel('Friction Coefficient (μ)')
-        axes[0].set_ylabel('Probability Density')
-        axes[0].set_title('Belief Distribution: Friction')
-        axes[0].legend()
-        axes[0].grid(True, alpha=0.3)
-        
-        # Mass distribution
-        axes[1].hist(self.mass_particles, weights=self.weights, bins=50,
-                    alpha=0.7, edgecolor='black')
-        axes[1].axvline(beliefs['mass_mean'], color='red', linestyle='--',
-                       label=f"Mean: {beliefs['mass_mean']:.2f}kg")
-        axes[1].set_xlabel('Mass (kg)')
-        axes[1].set_ylabel('Probability Density')
-        axes[1].set_title('Belief Distribution: Mass')
-        axes[1].legend()
-        axes[1].grid(True, alpha=0.3)
-        
+        if n_steps_remaining <= 0:
+            return 0.0
+        mu_s, m_s = self.sample_parameters(self.n_plan_samples)
+        F = self.candidate_forces[:, None]           # (n_forces, 1)
+        x_T, v_T = self.predict_final_state(
+            x, v, F, mu_s[None, :], m_s[None, :], n_steps_remaining)
+        err = x_T - target
+        w_over = overshoot_weight if n_steps_remaining > recourse_steps else 1.0
+        pos_cost = np.where(err > 0, w_over, 1.0) * err ** 2
+        cost = np.mean(pos_cost + speed_weight * v_T ** 2, axis=1)
+        return float(self.candidate_forces[np.argmin(cost)])
+
+    # -------------------------------------------------------------- inspection
+    def visualize_beliefs(self, true_friction=None, true_mass=None):
+        """Joint posterior plus marginals."""
+        w = self.weights.reshape(len(self.friction_values), len(self.mass_values))
+        b = self.get_beliefs()
+        fig, axes = plt.subplots(1, 3, figsize=(16, 4))
+
+        axes[0].imshow(w.T, origin='lower', aspect='auto', cmap='viridis',
+                       extent=[self.friction_values[0], self.friction_values[-1],
+                               self.mass_values[0], self.mass_values[-1]])
+        if true_friction is not None and true_mass is not None:
+            axes[0].plot(true_friction, true_mass, 'r+', ms=14, mew=2, label='truth')
+            axes[0].legend()
+        axes[0].set_xlabel('Friction μ'); axes[0].set_ylabel('Mass (kg)')
+        axes[0].set_title('Joint posterior P(μ, m | history)')
+
+        axes[1].plot(self.friction_values, w.sum(axis=1))
+        axes[1].axvline(b['friction_mean'], color='red', ls='--',
+                        label=f"mean {b['friction_mean']:.3f}")
+        axes[1].set_xlabel('Friction μ'); axes[1].set_title('Marginal: friction')
+        axes[1].legend(); axes[1].grid(True, alpha=0.3)
+
+        axes[2].plot(self.mass_values, w.sum(axis=0))
+        axes[2].axvline(b['mass_mean'], color='red', ls='--',
+                        label=f"mean {b['mass_mean']:.2f}kg")
+        axes[2].set_xlabel('Mass (kg)'); axes[2].set_title('Marginal: mass')
+        axes[2].legend(); axes[2].grid(True, alpha=0.3)
+
         plt.tight_layout()
         return fig
 
 
 class CausalDiscoveryPolicy:
-    """
-    Policy wrapper that uses Bayesian causal agent for decision making
-    Compatible with Gym interface
-    """
-    
-    def __init__(self, exploration_steps=3):
-        self.agent = BayesianCausalAgent()
-        self.exploration_steps = exploration_steps
-        self.episode_step = 0
-    
+    """Gym-style wrapper: infer confounders online, act on the posterior."""
+
+    # Observation layout from RealisticCausalPushEnv:
+    # [x, y, vx, vy, target, history(5*H), forces(H)] -- most recent force last
+    X, VX, TARGET = 0, 2, 4
+
+    def __init__(self, max_episode_steps=20, rng=None, **agent_kwargs):
+        self.agent = BayesianCausalAgent(rng=rng, **agent_kwargs)
+        self.max_episode_steps = max_episode_steps
+        self.reset()
+
     def reset(self):
-        """Reset for new episode"""
         self.agent.reset_beliefs()
         self.episode_step = 0
-        self.last_position = 0.0
-    
+        self.last_x = None
+        self.last_v = None
+
     def predict(self, observation, deterministic=True):
-        """
-        Choose action given observation
-        
-        FIXED: Properly extract information from observation
-        """
-        # Extract current position from observation
-        # observation structure: [x, y, vx, vy, target, history(15), forces(3)]
-        current_position = observation[0]
-        current_velocity = observation[2]
-        
-        # Update beliefs if we've taken an action
+        x = float(observation[self.X])
+        v = float(observation[self.VX])
+        target = float(observation[self.TARGET])
+
+        # Learn from the step we just took (force as actually applied by env)
         if self.episode_step > 0:
-            # Calculate distance moved since last step
-            distance_moved = abs(current_position - self.last_position)
-            
-            # Get last applied force from observation history
-            # Last 3 values are force history, most recent is [-1]
-            if len(observation) >= 23:  # Ensure we have full observation
-                last_force = observation[-1]
-            else:
-                last_force = 3.0  # Default fallback
-            
-            # Only update if we have meaningful movement or lack thereof
-            if self.episode_step <= 10:  # Update during first half of episode
-                self.agent.update_beliefs(
-                    force_applied=last_force, 
-                    observed_distance=distance_moved,
-                    n_steps=1  # One control step
-                )
-        
-        # Choose force based on current mode
-        remaining_distance = 0.1 - current_position  # Distance to target
-        remaining_steps = 20 - self.episode_step  # Steps left
-        
-        # Exploration phase: gather information
-        if self.episode_step < self.exploration_steps:
-            mode = 'explore'
-            force = self.agent.choose_force(
-                target_distance=remaining_distance, 
-                n_steps=remaining_steps, 
-                mode=mode
-            )
-        else:
-            # Exploitation: use inferred beliefs to reach target
-            mode = 'exploit'
-            force = self.agent.choose_force(
-                target_distance=remaining_distance,
-                n_steps=remaining_steps,
-                mode=mode
-            )
-        
-        # Convert force to normalized action
-        action = (force - 3.0) / 2.5
-        action = np.clip(action, -1.0, 1.0)
-        
-        # Update state tracking
-        self.last_position = current_position
+            last_force = float(observation[-1])
+            self.agent.update_beliefs(self.last_x, self.last_v, last_force, x, v)
+
+        force = self.agent.choose_force(
+            x, v, target, self.max_episode_steps - self.episode_step)
+
+        self.last_x, self.last_v = x, v
         self.episode_step += 1
-        
-        return np.array([action]), None
+        return np.array([force_to_action(force)], dtype=np.float32), None

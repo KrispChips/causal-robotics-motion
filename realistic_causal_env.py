@@ -5,6 +5,22 @@ import pybullet_data
 from gymnasium import spaces
 import time
 
+# Action -> force mapping. Shared by the env, the causal agent and the eval
+# scripts so they can never disagree about what an action means.
+FORCE_MIN = 0.0   # N  (0 lets the block coast/brake on friction alone)
+FORCE_MAX = 8.0   # N  (high-friction test block needs > 0.35*1.4*9.8 = 4.8N)
+
+
+def action_to_force(action):
+    a = float(np.clip(action, -1.0, 1.0))
+    return FORCE_MIN + (a + 1.0) * 0.5 * (FORCE_MAX - FORCE_MIN)
+
+
+def force_to_action(force):
+    a = 2.0 * (force - FORCE_MIN) / (FORCE_MAX - FORCE_MIN) - 1.0
+    return float(np.clip(a, -1.0, 1.0))
+
+
 class RealisticCausalPushEnv(gym.Env):
     """
     Realistic Causal Robotics Environment
@@ -52,8 +68,10 @@ class RealisticCausalPushEnv(gym.Env):
         self.sim_freq = 240.0
         self.policy_freq = 10.0
         self.sim_steps_per_action = int(self.sim_freq / self.policy_freq)
-        self.max_episode_steps = 20  # REDUCED: 2 seconds (was 3 seconds)
-        
+        self.max_episode_steps = 20  # 2 seconds
+        # Block must be nearly at rest in the target zone to count as placed
+        self.success_speed = 0.05  # m/s
+
         # Episode tracking
         self.current_step = 0
         self.obs_history = []
@@ -97,9 +115,9 @@ class RealisticCausalPushEnv(gym.Env):
         """
         if self.distribution_mode == 'train':
             # Training: Narrow range of "typical" blocks
-            mass = np.random.uniform(0.8, 1.2)
-            base_friction = np.random.uniform(0.22, 0.28)
-            roughness = np.random.uniform(0.2, 0.4)  # REDUCED variance (was 0.5)
+            mass = self.np_random.uniform(0.8, 1.2)
+            base_friction = self.np_random.uniform(0.22, 0.28)
+            roughness = self.np_random.uniform(0.2, 0.4)  # REDUCED variance (was 0.5)
             
         elif self.distribution_mode == 'test_interp':
             # Interpolation: Middle of training range
@@ -129,9 +147,9 @@ class RealisticCausalPushEnv(gym.Env):
             
         else:
             # Fallback: Wide range
-            mass = np.random.uniform(0.6, 1.4)
-            base_friction = np.random.uniform(0.18, 0.32)
-            roughness = np.random.uniform(0.0, 1.0)
+            mass = self.np_random.uniform(0.6, 1.4)
+            base_friction = self.np_random.uniform(0.18, 0.32)
+            roughness = self.np_random.uniform(0.0, 1.0)
             
         return mass, base_friction, roughness
 
@@ -143,7 +161,7 @@ class RealisticCausalPushEnv(gym.Env):
         # Sample actual friction from distribution
         # Roughness determines variance
         friction_std = self.roughness * 0.02
-        actual_friction = np.random.normal(self.base_friction, friction_std)
+        actual_friction = self.np_random.normal(self.base_friction, friction_std)
         actual_friction = np.clip(actual_friction, 0.1, 0.5)
         
         p.changeDynamics(
@@ -216,6 +234,7 @@ class RealisticCausalPushEnv(gym.Env):
         base_obs = self._get_base_obs()
         self.obs_history = [base_obs.copy() for _ in range(self.history_length)]
         self.force_history = [0.0] * self.history_length
+        self.prev_dist = abs(base_obs[0] - self.target_dist)
         
         if self.render_mode == "human":
             p.resetDebugVisualizerCamera(
@@ -240,85 +259,67 @@ class RealisticCausalPushEnv(gym.Env):
         else:
             act = action
         
-        act = np.clip(act, -1.0, 1.0)
-        
-        # FIX 1: Increased force range to ensure high friction blocks can move
-        # Map action to force: [-1, 1] → [0.5N, 5.5N]
-        # Gives more headroom for high friction (4.4N required)
-        force_mag = 3.0 + (act * 2.5)
-        
-        # Apply force and simulate
-        # FIX 2: Sample friction ONCE per action, not per simulation step
-        # This reduces excessive stochasticity
+        force_mag = action_to_force(act)
+
+        # Friction is resampled once per action (roughness = per-step noise)
         self.current_friction = self._apply_stochastic_friction()
-        
+
+        # No artificial damping: the block slows down through Coulomb friction
+        # only. (The old per-substep resetBaseVelocity(v*0.98) shrank velocity
+        # 0.98**24 = 0.62x per control step and fought the contact solver.)
         for _ in range(self.sim_steps_per_action):
+            # In WORLD_FRAME posObj is a world point, so push at the block's
+            # current centre of mass (not the world origin).
+            block_pos, _ = p.getBasePositionAndOrientation(
+                self.block_id, physicsClientId=self.client)
             p.applyExternalForce(
                 self.block_id,
                 -1,
                 forceObj=[force_mag, 0, 0],
-                posObj=[0, 0, 0],
+                posObj=block_pos,
                 flags=p.WORLD_FRAME,
                 physicsClientId=self.client
             )
             p.stepSimulation(physicsClientId=self.client)
-            
-            # Apply air resistance (slight damping)
-            vel, ang_vel = p.getBaseVelocity(self.block_id, physicsClientId=self.client)
-            damping = 0.98
-            p.resetBaseVelocity(
-                self.block_id,
-                linearVelocity=[vel[0]*damping, vel[1]*damping, vel[2]],
-                angularVelocity=ang_vel,
-                physicsClientId=self.client
-            )
-            
+
             if self.render_mode == "human":
                 time.sleep(1./self.sim_freq)
-        
+
         # Update observation history
         base_obs = self._get_base_obs()
         self.obs_history.append(base_obs.copy())
         self.obs_history.pop(0)
         self.force_history.append(force_mag)
         self.force_history.pop(0)
-        
-        # Calculate reward
+
         obs = self._get_obs()
         block_x = base_obs[0]
         dist_to_target = abs(block_x - self.target_dist)
-        success = dist_to_target < self.success_threshold
-        velocity = abs(base_obs[2])
-        
-        # REWARD FUNCTION (Fair to both RL and Causal)
-        # INCREASED penalties to force precision
-        
-        # 1. Precision reward (squared distance) - DOUBLED weight
-        reward = -(dist_to_target ** 2) * 100.0  # Was 50.0
-        
-        # 2. Success bonus
-        if success:
+        speed = abs(base_obs[2])
+        success = bool(dist_to_target <= self.success_threshold
+                       and speed <= self.success_speed)
+
+        # Fixed-horizon task: the episode really ends (and is scored) here,
+        # so this is termination, not a time-limit truncation.
+        terminated = self.current_step >= self.max_episode_steps
+        truncated = False
+
+        # REWARD
+        # Potential-based progress shaping: sums to 100*(d_start - d_final)
+        # over the episode, so doing nothing scores 0, reaching the target
+        # scores ~+10, and overshooting is penalised automatically (distance
+        # grows again). The old reward made "never push" (-20) beat any
+        # attempt to push, and PPO collapsed to it.
+        reward = 100.0 * (self.prev_dist - dist_to_target)
+        self.prev_dist = dist_to_target
+
+        # Small effort cost (tie-breaker, can't dominate the task reward)
+        reward -= 0.01 * (force_mag / FORCE_MAX) ** 2
+
+        # Terminal bonus for a block resting in the target zone
+        if terminated and success:
             reward += 10.0
-        
-        # 3. Energy efficiency penalty - INCREASED
-        # Forces agent to use minimal necessary force
-        normalized_force = (force_mag - 0.5) / 5.0
-        energy_penalty = (normalized_force ** 2) * 5.0  # Was 2.0
-        reward -= energy_penalty
-        
-        # 4. Velocity penalty (smooth control) - INCREASED
-        if velocity > 0.2:  # Stricter threshold (was 0.3)
-            reward -= velocity * 5.0  # Was 2.0
-        
-        # 5. Overshoot penalty - MUCH STRONGER
-        if block_x > self.target_dist + self.success_threshold:
-            overshoot = block_x - (self.target_dist + self.success_threshold)
-            reward -= overshoot * 50.0  # Was 20.0
-        
-        # Termination
-        terminated = False  # Don't terminate early
-        truncated = self.current_step >= self.max_episode_steps
-        
+
         # Info for analysis
         info = {
             "true_mass": self.mass,
@@ -328,7 +329,6 @@ class RealisticCausalPushEnv(gym.Env):
             "is_success": success,
             "final_distance": dist_to_target,
             "applied_force": force_mag,
-            "TimeLimit.truncated": truncated
         }
         
         return obs, reward, terminated, truncated, info

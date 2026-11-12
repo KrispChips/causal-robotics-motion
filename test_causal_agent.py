@@ -1,180 +1,114 @@
 """
-Quick test to verify causal agent works before full evaluation
+Quick checks of the Bayesian causal agent before full evaluation.
 """
 
 import numpy as np
-from realistic_causal_env import RealisticCausalPushEnv
-from bayesian_causal_agent import BayesianCausalAgent, CausalDiscoveryPolicy
 import matplotlib.pyplot as plt
+from realistic_causal_env import RealisticCausalPushEnv, force_to_action
+from bayesian_causal_agent import BayesianCausalAgent, CausalDiscoveryPolicy, simulate_step
+
 
 def test_physics_model():
-    """Test if physics model predicts correctly"""
-    print("="*70)
-    print("TEST 1: Physics Model Accuracy")
-    print("="*70)
-    
-    agent = BayesianCausalAgent()
-    
-    # Test predictions for known scenarios
-    scenarios = [
-        (1.0, 0.25, 1.0, "Low force, medium friction"),
-        (3.0, 0.25, 1.0, "Medium force, medium friction"),
-        (5.0, 0.25, 1.0, "High force, medium friction"),
-        (3.0, 0.15, 1.0, "Medium force, LOW friction"),
-        (3.0, 0.35, 1.0, "Medium force, HIGH friction"),
-    ]
-    
-    print("\nPredicted distances:")
-    for force, friction, mass, description in scenarios:
-        distance = agent.predict_distance(force, friction, mass, n_steps=20)
-        print(f"  {description:35s}: {distance*100:.2f}cm (target: 10cm)")
-    
-    print("\n✓ Physics model runs without errors")
+    """Agent's dynamics model vs PyBullet, using the friction the env actually
+    applied on each step (isolates model error from roughness noise)."""
+    print("=" * 70)
+    print("TEST 1: Dynamics model matches simulator")
+    print("=" * 70)
+    env = RealisticCausalPushEnv(distribution_mode='test_interp')
+    x_err, v_err = [], []
+    for seq in ([3, 3, 0, 0, 0], [6, 2, 0, 0, 0], [8, 0, 0, 0, 0], [1, 2, 5, 0, 0]):
+        obs, _ = env.reset(seed=0)
+        for F in seq:
+            x, v = obs[0], obs[2]
+            obs, _, _, _, info = env.step(np.array([force_to_action(F)]))
+            px, pv = simulate_step(x, v, F, info['current_friction'], env.mass)
+            x_err.append(abs(obs[0] - px)); v_err.append(abs(obs[2] - pv))
+    env.close()
+    print(f"  max |x error| per step: {max(x_err)*1000:.2f} mm")
+    print(f"  max |v error| per step: {max(v_err)*1000:.1f} mm/s")
+    assert max(x_err) < 0.002 and max(v_err) < 0.02, "model/sim mismatch"
+    print("✓ Model matches simulator")
+
 
 def test_belief_updating():
-    """Test if beliefs update correctly"""
-    print("\n" + "="*70)
-    print("TEST 2: Belief Updating")
-    print("="*70)
-    
-    agent = BayesianCausalAgent()
-    
-    print("\nInitial beliefs:")
-    beliefs = agent.get_beliefs()
-    print(f"  Friction: {beliefs['friction_mean']:.3f} ± {beliefs['friction_std']:.3f}")
-    print(f"  Mass: {beliefs['mass_mean']:.2f} ± {beliefs['mass_std']:.2f}kg")
-    
-    # Simulate observation: applied 3N, moved 5cm (suggests high friction)
-    print("\nObservation: Applied 3N, block moved 5cm")
-    agent.update_beliefs(force_applied=3.0, observed_distance=0.05, n_steps=20)
-    
-    beliefs = agent.get_beliefs()
-    print(f"  Updated Friction: {beliefs['friction_mean']:.3f} ± {beliefs['friction_std']:.3f}")
-    print(f"  Updated Mass: {beliefs['mass_mean']:.2f} ± {beliefs['mass_std']:.2f}kg")
-    
-    # Another observation
-    print("\nObservation: Applied 5N, block moved 8cm")
-    agent.update_beliefs(force_applied=5.0, observed_distance=0.08, n_steps=20)
-    
-    beliefs = agent.get_beliefs()
-    print(f"  Updated Friction: {beliefs['friction_mean']:.3f} ± {beliefs['friction_std']:.3f}")
-    print(f"  Updated Mass: {beliefs['mass_mean']:.2f} ± {beliefs['mass_std']:.2f}kg")
-    
-    print("\n✓ Beliefs update based on observations")
-    
-    # Visualize
-    fig = agent.visualize_beliefs()
+    """Posterior should concentrate near the truth after one episode."""
+    print("\n" + "=" * 70)
+    print("TEST 2: Belief updating")
+    print("=" * 70)
+    env = RealisticCausalPushEnv(distribution_mode='test_extrap_high')
+    policy = CausalDiscoveryPolicy(rng=np.random.default_rng(0))
+    obs, _ = env.reset(seed=0); policy.reset()
+    prior = policy.agent.get_beliefs()
+    done = False
+    while not done:
+        action, _ = policy.predict(obs)
+        obs, _, terminated, truncated, _ = env.step(action)
+        done = terminated or truncated
+    b = policy.agent.get_beliefs()
+    print(f"  True:      μ={env.base_friction:.3f}, m={env.mass:.2f}kg")
+    print(f"  Prior:     μ={prior['friction_mean']:.3f}±{prior['friction_std']:.3f}, "
+          f"m={prior['mass_mean']:.2f}±{prior['mass_std']:.2f}kg")
+    print(f"  Posterior: μ={b['friction_mean']:.3f}±{b['friction_std']:.3f}, "
+          f"m={b['mass_mean']:.2f}±{b['mass_std']:.2f}kg")
+    assert abs(b['friction_mean'] - env.base_friction) < 0.05
+    assert b['friction_std'] < prior['friction_std'] / 3
+    fig = policy.agent.visualize_beliefs(env.base_friction, env.mass)
     plt.savefig('belief_visualization_test.png', dpi=150)
-    print("✓ Belief visualization saved as 'belief_visualization_test.png'")
-    plt.close()
+    plt.close(fig)
+    env.close()
+    print("✓ Posterior concentrates near truth (plot: belief_visualization_test.png)")
+
 
 def test_force_selection():
-    """Test if agent chooses reasonable forces"""
-    print("\n" + "="*70)
-    print("TEST 3: Force Selection")
-    print("="*70)
-    
-    agent = BayesianCausalAgent()
-    
-    # Set beliefs manually to known values
-    agent.friction_particles = np.ones(1000) * 0.25
-    agent.mass_particles = np.ones(1000) * 1.0
-    agent.weights = np.ones(1000) / 1000
-    
-    beliefs = agent.get_beliefs()
-    print(f"\nSet beliefs: μ={beliefs['friction_mean']:.3f}, m={beliefs['mass_mean']:.2f}kg")
-    
-    force = agent.choose_force(target_distance=0.1, n_steps=20, mode='exploit')
-    predicted = agent.predict_distance(force, beliefs['friction_mean'], 
-                                      beliefs['mass_mean'], n_steps=20)
-    
-    print(f"Chosen force: {force:.2f}N")
-    print(f"Predicted distance: {predicted*100:.2f}cm (target: 10cm)")
-    
-    if abs(predicted - 0.1) < 0.02:
-        print("✓ Force selection achieves target")
-    else:
-        print("⚠ Force selection may need tuning")
+    """With beliefs pinned to the truth, the planned push should land on target."""
+    print("\n" + "=" * 70)
+    print("TEST 3: Force selection with known parameters")
+    print("=" * 70)
+    agent = BayesianCausalAgent(rng=np.random.default_rng(0))
+    mu, m = 0.25, 1.0
+    agent.log_post[:] = -np.inf
+    i = np.argmin(abs(agent.friction_values - mu)) * len(agent.mass_values) \
+        + np.argmin(abs(agent.mass_values - m))
+    agent.log_post[i] = 0.0
+    mu, m = agent.mu_flat[i], agent.m_flat[i]
+    # Closed loop in the agent's own model (one push can't cover 10cm at
+    # F_max, so the planner must chain pushes and then coast)
+    x, v, forces = 0.0, 0.0, []
+    for t in range(20):
+        F = agent.choose_force(x, v, 0.1, n_steps_remaining=20 - t)
+        forces.append(F)
+        x, v = simulate_step(x, v, F, mu, m)
+    print(f"  μ={mu:.3f}, m={m:.2f}kg -> forces {np.round(forces[:6], 2)}..., "
+          f"rest at {x*100:.2f}cm")
+    assert abs(x - 0.1) < 0.01
+    print("✓ Planned forces reach target")
+
 
 def test_single_episode():
-    """Run one complete episode"""
-    print("\n" + "="*70)
-    print("TEST 4: Complete Episode")
-    print("="*70)
-    
-    env = RealisticCausalPushEnv(render_mode=None, distribution_mode='train')
-    policy = CausalDiscoveryPolicy(exploration_steps=3)
-    
-    obs, _ = env.reset()
-    policy.reset()
-    
-    print(f"\nTrue confounders: μ={env.base_friction:.3f}, m={env.mass:.2f}kg, r={env.roughness:.2f}")
-    
-    done = False
-    step = 0
-    
-    while not done and step < 20:
+    print("\n" + "=" * 70)
+    print("TEST 4: Complete episode")
+    print("=" * 70)
+    env = RealisticCausalPushEnv(distribution_mode='train')
+    policy = CausalDiscoveryPolicy(rng=np.random.default_rng(1))
+    obs, _ = env.reset(seed=1); policy.reset()
+    print(f"  True: μ={env.base_friction:.3f}, m={env.mass:.2f}kg, r={env.roughness:.2f}")
+    done, step = False, 0
+    while not done:
         action, _ = policy.predict(obs)
         obs, reward, terminated, truncated, info = env.step(action)
-        
-        force = 3.0 + action[0] * 2.5
-        
-        if step < 5 or step == 19:
-            print(f"\n  Step {step+1}:")
-            print(f"    Position: {obs[0]*100:.2f}cm")
-            print(f"    Force: {force:.2f}N")
-            print(f"    Reward: {reward:.2f}")
-            
-            if step >= 1:
-                beliefs = policy.agent.get_beliefs()
-                print(f"    Beliefs: μ={beliefs['friction_mean']:.3f}, m={beliefs['mass_mean']:.2f}kg")
-        
         done = terminated or truncated
+        if step < 6:
+            b = policy.agent.get_beliefs()
+            print(f"  step {step+1}: F={info['applied_force']:.2f}N x={obs[0]*100:.2f}cm "
+                  f"v={obs[2]:.3f}  μ̂={b['friction_mean']:.3f}±{b['friction_std']:.3f}")
         step += 1
-    
-    beliefs = policy.agent.get_beliefs()
-    print(f"\n  Final beliefs: μ={beliefs['friction_mean']:.3f}, m={beliefs['mass_mean']:.2f}kg")
-    print(f"  Final distance: {info['final_distance']*100:.2f}cm")
-    print(f"  Success: {info['is_success']}")
-    
-    # Inference errors
-    friction_error = abs(beliefs['friction_mean'] - env.base_friction)
-    mass_error = abs(beliefs['mass_mean'] - env.mass)
-    
-    print(f"\n  Inference errors:")
-    print(f"    Friction: {friction_error:.3f}")
-    print(f"    Mass: {mass_error:.2f}kg")
-    
-    if info['is_success']:
-        print("\n✓ Episode succeeded!")
-    else:
-        print(f"\n⚠ Episode failed (distance: {info['final_distance']*100:.2f}cm)")
-    
+    print(f"  Final distance: {info['final_distance']*100:.2f}cm, success={info['is_success']}")
     env.close()
 
+
 if __name__ == "__main__":
-    print("\n" + "="*70)
-    print("CAUSAL AGENT TEST SUITE")
-    print("="*70)
-    print("Testing Bayesian Causal Discovery Agent\n")
-    
-    try:
-        test_physics_model()
-        test_belief_updating()
-        test_force_selection()
-        test_single_episode()
-        
-        print("\n" + "="*70)
-        print("ALL TESTS PASSED ✓")
-        print("="*70)
-        print("\nCausal agent is working!")
-        print("\nNext step: Run full evaluation")
-        print("  python eval_causal_agent.py")
-        
-    except Exception as e:
-        print("\n" + "="*70)
-        print("TEST FAILED ✗")
-        print("="*70)
-        print(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
+    test_physics_model()
+    test_belief_updating()
+    test_force_selection()
+    test_single_episode()
+    print("\nALL TESTS PASSED ✓")
