@@ -25,9 +25,15 @@ Method
   every (mu, m) with mu*m*g < F predicts motion and is penalised.
 * Identifiability: pushing gives  a = F/m - mu*g,  coasting gives  a = -mu*g.
   Both phases happen in every episode, so mu and m are separable.
-* Control: at each step, choose the force for this step (then coast with
-  F = 0) that minimises the posterior-expected squared error of the block's
-  final position. Re-planned every step as the posterior sharpens.
+* Control (exploit): at each step, choose the force for this step (then
+  coast with F = 0) that minimises the posterior-expected cost of the final
+  position. Re-planned every step as the posterior sharpens.
+* Active discovery (PDF Stage 3): before exploiting, choose *safe* probe
+  forces that maximise expected information gain
+      IG(F) = H[P(mu,m | h)] - E_y[ H[P(mu,m | h, F, y)] ]
+  where "safe" means the posterior probability that the probe makes the
+  block overshoot the target is small (overshoot is irreversible because
+  the agent can only push).
 """
 
 import numpy as np
@@ -48,6 +54,30 @@ def simulate_step(x, v, force, mu, mass, substeps=SUBSTEPS, dt=SIM_DT):
         v = np.maximum(v + (force / mass - decel_friction) * dt, 0.0)
         x = x + v * dt
     return x, v
+
+
+def plan_force(rollout, x, v, target, n_steps_remaining, candidate_forces,
+               speed_weight=0.1, overshoot_weight=10.0, recourse_steps=3):
+    """Shared planner (used by the causal agent and the model-based baseline,
+    so they differ only in their dynamics model).
+
+    rollout(x, v, F, n_steps) -> (x_T, v_T), each shaped (n_forces, n_samples):
+    final state after applying F[i] for one step and coasting afterwards,
+    under each of n_samples plausible dynamics (posterior samples or
+    ensemble members).
+
+    Cost is asymmetric while there is time left to correct: undershoot is
+    recoverable on a later step but overshoot never is, so early pushes are
+    cautious while the dynamics are still uncertain.
+    """
+    if n_steps_remaining <= 0:
+        return 0.0
+    x_T, v_T = rollout(x, v, candidate_forces[:, None], n_steps_remaining)
+    err = x_T - target
+    w_over = overshoot_weight if n_steps_remaining > recourse_steps else 1.0
+    pos_cost = np.where(err > 0, w_over, 1.0) * err ** 2
+    cost = np.mean(pos_cost + speed_weight * v_T ** 2, axis=1)
+    return float(candidate_forces[np.argmin(cost)])
 
 
 class BayesianCausalAgent:
@@ -92,13 +122,16 @@ class BayesianCausalAgent:
         w = np.exp(self.log_post - self.log_post.max())
         return w / w.sum()
 
+    def _log_likelihood(self, v_observed, v_predicted):
+        resid = (v_observed - v_predicted) / self.velocity_noise_std
+        return -0.5 * resid ** 2
+
     def update_beliefs(self, x_before, v_before, force_applied, x_after, v_after):
         """Bayes rule for one control step:
         log P(mu,m | data) += log N(v_after; v_pred(mu,m), sigma_v^2)."""
         _, v_pred = simulate_step(x_before, v_before, force_applied,
                                   self.mu_flat, self.m_flat)
-        resid = (v_after - v_pred) / self.velocity_noise_std
-        self.log_post += -0.5 * resid ** 2
+        self.log_post += self._log_likelihood(v_after, v_pred)
         self.log_post -= self.log_post.max()  # keep numerically bounded
         self.interaction_history.append({
             'x_before': x_before, 'v_before': v_before, 'force': force_applied,
@@ -115,12 +148,11 @@ class BayesianCausalAgent:
         fric_force = self.mu_flat * self.m_flat * G
         ff_mean = np.sum(w * fric_force)
         ff_std = np.sqrt(np.sum(w * (fric_force - ff_mean) ** 2))
-        nz = w[w > 0]
         return {
             'friction_mean': mu_mean, 'friction_std': mu_std,
             'mass_mean': m_mean, 'mass_std': m_std,
             'friction_force_mean': ff_mean, 'friction_force_std': ff_std,
-            'entropy': -np.sum(nz * np.log(nz)),
+            'entropy': _entropy(w),
         }
 
     def sample_parameters(self, n):
@@ -135,27 +167,78 @@ class BayesianCausalAgent:
             x, v = simulate_step(x, v, 0.0, mu, mass)
         return x, v
 
-    def choose_force(self, x, v, target, n_steps_remaining,
-                     speed_weight=0.1, overshoot_weight=10.0,
-                     recourse_steps=3):
-        """Force minimising the posterior-expected cost of the final state.
-
-        Cost is asymmetric while there is time left to correct: the agent can
-        only push, so undershoot is recoverable on a later step (with a
-        sharper posterior) but overshoot never is. Weighting overshoot more
-        makes early pushes cautious while mu and m are still uncertain.
-        """
-        if n_steps_remaining <= 0:
-            return 0.0
+    def _posterior_rollout(self):
         mu_s, m_s = self.sample_parameters(self.n_plan_samples)
-        F = self.candidate_forces[:, None]           # (n_forces, 1)
-        x_T, v_T = self.predict_final_state(
-            x, v, F, mu_s[None, :], m_s[None, :], n_steps_remaining)
-        err = x_T - target
-        w_over = overshoot_weight if n_steps_remaining > recourse_steps else 1.0
-        pos_cost = np.where(err > 0, w_over, 1.0) * err ** 2
-        cost = np.mean(pos_cost + speed_weight * v_T ** 2, axis=1)
-        return float(self.candidate_forces[np.argmin(cost)])
+        return lambda x, v, F, n: self.predict_final_state(
+            x, v, F, mu_s[None, :], m_s[None, :], n)
+
+    def choose_force(self, x, v, target, n_steps_remaining, **plan_kwargs):
+        """Exploit: posterior-expected best force (see plan_force)."""
+        return plan_force(self._posterior_rollout(), x, v, target,
+                          n_steps_remaining, self.candidate_forces, **plan_kwargs)
+
+    # ---------------------------------------------------------- active discovery
+    def safe_forces(self, x, v, target, n_steps_remaining,
+                    margin=0.02, max_risk=0.01, n_samples=1024):
+        """Forces whose posterior probability of carrying the block (after
+        coasting) beyond target - margin is at most max_risk.
+
+        max_risk is small on purpose: an overshoot ends the episode, and with
+        a wide prior the true block can easily sit in a 5% tail (e.g. the
+        light, slippery test block)."""
+        mu_s, m_s = self.sample_parameters(n_samples)
+        x_T, _ = self.predict_final_state(
+            x, v, self.candidate_forces[:, None], mu_s[None, :], m_s[None, :],
+            n_steps_remaining)
+        risk = np.mean(x_T > target - margin, axis=1)
+        return self.candidate_forces[risk <= max_risk]
+
+    def expected_information_gain(self, x, v, forces, n_outcomes=32,
+                                  prune=1e-6):
+        """Monte-Carlo estimate of IG(F) for each F in `forces` (nats).
+
+        For each F: draw (mu, m) from the posterior, simulate the next
+        velocity, add observation noise -> hypothetical outcome y; update
+        the posterior with y and measure its entropy. IG = H_now - E[H_after].
+        Grid points with negligible posterior mass are pruned for speed.
+        """
+        w = self.weights
+        keep = w > w.max() * prune
+        w_k = w[keep] / w[keep].sum()
+        log_w_k = np.log(w_k)
+        mu_k, m_k = self.mu_flat[keep], self.m_flat[keep]
+        h_now = _entropy(w_k)
+
+        ig = np.empty(len(forces))
+        for i, F in enumerate(forces):
+            _, v_pred = simulate_step(x, v, F, mu_k, m_k)            # (K,)
+            truth = self.rng.choice(len(w_k), size=n_outcomes, p=w_k)
+            y = v_pred[truth] + self.rng.normal(0, self.velocity_noise_std,
+                                                n_outcomes)
+            log_post = log_w_k[None, :] + self._log_likelihood(
+                y[:, None], v_pred[None, :])                          # (n_out, K)
+            log_post -= log_post.max(axis=1, keepdims=True)
+            post = np.exp(log_post)
+            post /= post.sum(axis=1, keepdims=True)
+            ig[i] = h_now - np.mean([_entropy(p) for p in post])
+        return ig
+
+    def choose_exploratory_force(self, x, v, target, n_steps_remaining,
+                                 strategy='active', max_candidates=17,
+                                 min_gain=0.05):
+        """Return a safe probe force, or None if exploration should stop
+        (no safe informative force left)."""
+        safe = self.safe_forces(x, v, target, n_steps_remaining)
+        if len(safe) == 0:
+            return None
+        if len(safe) > max_candidates:
+            safe = safe[np.linspace(0, len(safe) - 1, max_candidates).astype(int)]
+        if strategy == 'random':
+            return float(self.rng.choice(safe))
+        ig = self.expected_information_gain(x, v, safe)
+        if ig.max() < min_gain:
+            return None
+        return float(safe[np.argmax(ig)])
 
     # -------------------------------------------------------------- inspection
     def visualize_beliefs(self, true_friction=None, true_mass=None):
@@ -189,15 +272,37 @@ class BayesianCausalAgent:
         return fig
 
 
+def _entropy(p):
+    p = p[p > 0]
+    return float(-np.sum(p * np.log(p)))
+
+
 class CausalDiscoveryPolicy:
-    """Gym-style wrapper: infer confounders online, act on the posterior."""
+    """Gym-style wrapper: infer confounders online, act on the posterior.
+
+    exploration:
+      'none'   - passive: always exploit; information comes only as a
+                 by-product of goal-directed pushes.
+      'active' - Stage 3: safe probes chosen by expected information gain
+                 until the posterior is sharp (or no informative safe probe
+                 remains, or max_explore_steps is hit), then exploit.
+      'random' - control for 'active': same safety rule and stopping rule,
+                 but the probe force is drawn uniformly from the safe set.
+    """
 
     # Observation layout from RealisticCausalPushEnv:
     # [x, y, vx, vy, target, history(5*H), forces(H)] -- most recent force last
     X, VX, TARGET = 0, 2, 4
 
-    def __init__(self, max_episode_steps=20, rng=None, **agent_kwargs):
+    def __init__(self, exploration='none', max_explore_steps=8,
+                 friction_tol=0.02, mass_tol=0.05,
+                 max_episode_steps=20, rng=None, **agent_kwargs):
+        assert exploration in ('none', 'active', 'random')
         self.agent = BayesianCausalAgent(rng=rng, **agent_kwargs)
+        self.exploration = exploration
+        self.max_explore_steps = max_explore_steps
+        self.friction_tol = friction_tol
+        self.mass_tol = mass_tol
         self.max_episode_steps = max_episode_steps
         self.reset()
 
@@ -206,19 +311,36 @@ class CausalDiscoveryPolicy:
         self.episode_step = 0
         self.last_x = None
         self.last_v = None
+        self.exploring = self.exploration != 'none'
+        self.n_explore_steps = 0
+
+    def _still_uncertain(self):
+        b = self.agent.get_beliefs()
+        return b['friction_std'] > self.friction_tol or b['mass_std'] > self.mass_tol
 
     def predict(self, observation, deterministic=True):
         x = float(observation[self.X])
         v = float(observation[self.VX])
         target = float(observation[self.TARGET])
+        steps_left = self.max_episode_steps - self.episode_step
 
         # Learn from the step we just took (force as actually applied by env)
         if self.episode_step > 0:
             last_force = float(observation[-1])
             self.agent.update_beliefs(self.last_x, self.last_v, last_force, x, v)
 
-        force = self.agent.choose_force(
-            x, v, target, self.max_episode_steps - self.episode_step)
+        force = None
+        if self.exploring:
+            if (self.n_explore_steps < self.max_explore_steps
+                    and self._still_uncertain()):
+                force = self.agent.choose_exploratory_force(
+                    x, v, target, steps_left, strategy=self.exploration)
+            if force is None:
+                self.exploring = False  # switch to exploitation for good
+            else:
+                self.n_explore_steps += 1
+        if force is None:
+            force = self.agent.choose_force(x, v, target, steps_left)
 
         self.last_x, self.last_v = x, v
         self.episode_step += 1

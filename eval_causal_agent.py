@@ -1,265 +1,227 @@
 """
-Evaluate Bayesian Causal Discovery Agent
+Compare all agents across the train / test distributions.
 
-Compare against baseline RL to demonstrate:
-1. Better generalization under distribution shift
-2. Accurate confounder inference
-3. Interpretable decision making
+Agents
+  PPO                - Baseline 1: model-free RL (models_realistic/best_model.zip)
+  Model-based RL     - Baseline 2: learned average dynamics + shared planner
+  Causal (passive)   - Bayesian confounder inference, exploit only
+  Causal (active IG) - + safe information-gain probing first (Stage 3)
+
+Every agent sees the same seeded episodes (paired comparison). Success
+rates are reported with 95% Wilson intervals.
+
+Run train.py and mbrl_baseline.py first (missing baselines are skipped).
 """
 
+import os
+import time
 import numpy as np
 import matplotlib.pyplot as plt
+
 from realistic_causal_env import RealisticCausalPushEnv
 from bayesian_causal_agent import CausalDiscoveryPolicy
-from stable_baselines3 import PPO
+from mbrl_baseline import ModelBasedPolicy, MODEL_PATH as MBRL_PATH
 
-def evaluate_causal_agent(env_mode, n_episodes=50, verbose=True):
-    """
-    Evaluate causal agent on a specific distribution
-    
-    Returns:
-        Dictionary with success rate, inference accuracy, etc.
-    """
-    env = RealisticCausalPushEnv(render_mode=None, distribution_mode=env_mode)
-    policy = CausalDiscoveryPolicy()
-    
-    successes = []
-    friction_errors = []
-    mass_errors = []
-    final_distances = []
-    all_beliefs = []
-    true_frictions = []  # FIXED: Track actual ground truth
-    true_masses = []     # FIXED: Track actual ground truth
-    
-    for episode in range(n_episodes):
-        obs, _ = env.reset()
-        policy.reset()
-        
-        done = False
-        step = 0
-        
-        while not done and step < 20:
-            action, _ = policy.predict(obs)
-            obs, reward, terminated, truncated, info = env.step(action)
-            done = terminated or truncated
-            step += 1
-        
-        # Record results
-        successes.append(info['is_success'])
-        final_distances.append(info['final_distance'])
-        
-        # FIXED: Store ground truth values
-        true_frictions.append(info['true_base_friction'])
-        true_masses.append(info['true_mass'])
-        
-        # Get final beliefs
-        beliefs = policy.agent.get_beliefs()
-        all_beliefs.append(beliefs)
-        
-        # Compare to ground truth
-        friction_error = abs(beliefs['friction_mean'] - info['true_base_friction'])
-        mass_error = abs(beliefs['mass_mean'] - info['true_mass'])
-        
-        friction_errors.append(friction_error)
-        mass_errors.append(mass_error)
-        
-        if verbose and episode < 5:
-            print(f"\n  Episode {episode+1}:")
-            print(f"    True: μ={info['true_base_friction']:.3f}, m={info['true_mass']:.2f}kg")
-            print(f"    Inferred: μ={beliefs['friction_mean']:.3f}±{beliefs['friction_std']:.3f}, "
-                  f"m={beliefs['mass_mean']:.2f}±{beliefs['mass_std']:.2f}kg")
-            print(f"    Success: {info['is_success']}, Distance: {info['final_distance']*100:.2f}cm")
-    
-    env.close()
-    
-    return {
-        'success_rate': np.mean(successes),
-        'mean_friction_error': np.mean(friction_errors),
-        'mean_mass_error': np.mean(mass_errors),
-        'mean_final_distance': np.mean(final_distances),
-        'std_final_distance': np.std(final_distances),
-        'beliefs': all_beliefs,
-        'true_frictions': true_frictions,  # FIXED: Include actual values
-        'true_masses': true_masses,        # FIXED: Include actual values
-        'successes': successes              # FIXED: Include per-episode success
-    }
+PPO_PATH = "models_realistic/best_model.zip"
 
-def evaluate_baseline_rl(env_mode, model_path, n_episodes=50):
-    """
-    Evaluate baseline RL agent for comparison
-    """
-    env = RealisticCausalPushEnv(render_mode=None, distribution_mode=env_mode)
-    model = PPO.load(model_path)
-    
-    successes = []
-    final_distances = []
-    
-    for episode in range(n_episodes):
-        obs, _ = env.reset()
-        done = False
-        
-        while not done:
-            action, _ = model.predict(obs, deterministic=True)
-            obs, reward, terminated, truncated, info = env.step(action)
-            done = terminated or truncated
-        
-        successes.append(info['is_success'])
-        final_distances.append(info['final_distance'])
-    
-    env.close()
-    
-    return {
-        'success_rate': np.mean(successes),
-        'mean_final_distance': np.mean(final_distances),
-        'std_final_distance': np.std(final_distances)
-    }
+DISTRIBUTIONS = {
+    'train': 'Train',
+    'test_interp': 'Interp',
+    'test_extrap_high': 'High μ',
+    'test_extrap_low': 'Low μ',
+    'test_adversarial': 'Adv',
+}
 
-def run_comparison():
-    """
-    Full comparison: Causal Discovery vs Baseline RL
-    """
-    print("="*70)
-    print("CAUSAL DISCOVERY vs BASELINE RL COMPARISON")
-    print("="*70)
-    
-    distributions = {
-        'train': 'Training Distribution',
-        'test_interp': 'Interpolation Test',
-        'test_extrap_high': 'High Friction Test',
-        'test_extrap_low': 'Low Friction Test',
-        'test_adversarial': 'Adversarial Test'
-    }
-    
-    causal_results = {}
-    baseline_results = {}
-    
-    # Evaluate causal agent
-    print("\n--- CAUSAL DISCOVERY AGENT ---")
-    for mode, description in distributions.items():
-        print(f"\n{description} ({mode}):")
-        causal_results[mode] = evaluate_causal_agent(mode, n_episodes=50, verbose=(mode=='train'))
-        
-        r = causal_results[mode]
-        print(f"  Success Rate: {r['success_rate']*100:.1f}%")
-        print(f"  Friction MAE: {r['mean_friction_error']:.3f}")
-        print(f"  Mass MAE: {r['mean_mass_error']:.2f}kg")
-    
-    # Evaluate baseline
-    print("\n--- BASELINE RL AGENT ---")
-    try:
-        for mode, description in distributions.items():
-            print(f"\n{description} ({mode}):")
-            baseline_results[mode] = evaluate_baseline_rl(
-                mode, "models_realistic/best_model.zip", n_episodes=50)
-            
-            r = baseline_results[mode]
-            print(f"  Success Rate: {r['success_rate']*100:.1f}%")
-    except FileNotFoundError:
-        print("  Baseline model not found. Train baseline first.")
-        baseline_results = None
-    
-    # Generate comparison plots
-    plot_comparison(causal_results, baseline_results, distributions)
-    
-    # Summary
-    print("\n" + "="*70)
-    print("SUMMARY")
-    print("="*70)
-    
-    for mode in distributions.keys():
-        causal_success = causal_results[mode]['success_rate']
-        baseline_success = baseline_results[mode]['success_rate'] if baseline_results else 0
-        
-        improvement = (causal_success - baseline_success) * 100
-        
-        print(f"\n{mode}:")
-        print(f"  Causal: {causal_success*100:.1f}%")
-        if baseline_results:
-            print(f"  Baseline: {baseline_success*100:.1f}%")
-            print(f"  Improvement: {improvement:+.1f}%")
-    
-    return causal_results, baseline_results
 
-def plot_comparison(causal_results, baseline_results, distributions):
-    """Generate comparison visualizations"""
-    
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-    
-    modes = list(distributions.keys())
-    x = np.arange(len(modes))
-    width = 0.35
-    
-    # Plot 1: Success Rate Comparison
-    causal_success = [causal_results[m]['success_rate']*100 for m in modes]
-    if baseline_results:
-        baseline_success = [baseline_results[m]['success_rate']*100 for m in modes]
-        axes[0,0].bar(x - width/2, baseline_success, width, label='Baseline RL', 
-                     alpha=0.7, color='orange')
-        axes[0,0].bar(x + width/2, causal_success, width, label='Causal Discovery',
-                     alpha=0.7, color='green')
+class PPOPolicy:
+    def __init__(self, path=PPO_PATH):
+        from stable_baselines3 import PPO
+        self.model = PPO.load(path, device="cpu")
+
+    def reset(self):
+        pass
+
+    def predict(self, obs, deterministic=True):
+        return self.model.predict(obs, deterministic=True)
+
+
+def build_agents():
+    """name -> zero-arg factory. Baselines are skipped if not trained."""
+    agents = {}
+    if os.path.exists(PPO_PATH):
+        agents['PPO'] = lambda: PPOPolicy()
     else:
-        axes[0,0].bar(x, causal_success, width, label='Causal Discovery',
-                     alpha=0.7, color='green')
-    
-    axes[0,0].axhline(y=80, color='gray', linestyle='--', label='Target (80%)')
-    axes[0,0].set_ylabel('Success Rate (%)')
-    axes[0,0].set_title('Success Rate: Causal vs Baseline')
-    axes[0,0].set_xticks(x)
-    axes[0,0].set_xticklabels(['Train', 'Interp', 'High μ', 'Low μ', 'Adv'], rotation=15)
-    axes[0,0].legend()
-    axes[0,0].set_ylim(0, 105)
-    axes[0,0].grid(True, alpha=0.3)
-    
-    # Plot 2: Inference Accuracy
-    friction_errors = [causal_results[m]['mean_friction_error'] for m in modes]
-    mass_errors = [causal_results[m]['mean_mass_error'] for m in modes]
-    
-    axes[0,1].bar(x - width/2, friction_errors, width, label='Friction Error',
-                 alpha=0.7, color='blue')
-    axes[0,1].bar(x + width/2, mass_errors, width, label='Mass Error (kg)',
-                 alpha=0.7, color='red')
-    axes[0,1].set_ylabel('Mean Absolute Error')
-    axes[0,1].set_title('Confounder Inference Accuracy')
-    axes[0,1].set_xticks(x)
-    axes[0,1].set_xticklabels(['Train', 'Interp', 'High μ', 'Low μ', 'Adv'], rotation=15)
-    axes[0,1].legend()
-    axes[0,1].grid(True, alpha=0.3)
-    
-    # Plot 3: Inferred Friction Distribution
-    for i, mode in enumerate(modes):
-        distances = [b['friction_mean'] for b in causal_results[mode]['beliefs']]
-        axes[1,0].scatter([i]*len(distances), distances, alpha=0.3, s=20)
-    
-    axes[1,0].set_ylabel('Inferred Friction (μ)')
-    axes[1,0].set_title('Inferred Friction Distribution')
-    axes[1,0].set_xticks(x)
-    axes[1,0].set_xticklabels(['Train', 'Interp', 'High μ', 'Low μ', 'Adv'], rotation=15)
-    axes[1,0].grid(True, alpha=0.3)
-    
-    # Plot 4: Success Rate vs True Friction - FIXED TO USE ACTUAL VALUES
-    colors = ['green', 'blue', 'red', 'orange', 'purple']
-    
-    for i, mode in enumerate(modes):
-        # FIXED: Use actual ground truth friction values
-        true_frictions = causal_results[mode]['true_frictions']
-        successes = causal_results[mode]['successes']
-        
-        # Jitter success values for visibility
-        successes_jittered = np.array(successes) + np.random.normal(0, 0.02, len(successes))
-        
-        axes[1,1].scatter(true_frictions, successes_jittered, 
-                         alpha=0.5, color=colors[i], label=mode, s=30)
-    
-    axes[1,1].set_xlabel('True Friction Coefficient')
-    axes[1,1].set_ylabel('Success (0/1)')
-    axes[1,1].set_title('Causal Agent: Success vs True Friction')
-    axes[1,1].legend(fontsize=8)
-    axes[1,1].set_ylim(-0.1, 1.1)
-    axes[1,1].grid(True, alpha=0.3)
-    
+        print(f"  (skipping PPO: {PPO_PATH} not found -- run train.py)")
+    if os.path.exists(MBRL_PATH):
+        agents['Model-based RL'] = lambda: ModelBasedPolicy()
+    else:
+        print(f"  (skipping model-based RL: {MBRL_PATH} not found -- run mbrl_baseline.py)")
+    agents['Causal (passive)'] = lambda: CausalDiscoveryPolicy(
+        exploration='none', rng=np.random.default_rng(0))
+    agents['Causal (active IG)'] = lambda: CausalDiscoveryPolicy(
+        exploration='active', rng=np.random.default_rng(0))
+    return agents
+
+
+def wilson_interval(k, n, z=1.96):
+    if n == 0:
+        return 0.0, 0.0
+    p = k / n
+    denom = 1 + z ** 2 / n
+    centre = (p + z ** 2 / (2 * n)) / denom
+    half = z * np.sqrt(p * (1 - p) / n + z ** 2 / (4 * n ** 2)) / denom
+    return centre - half, centre + half
+
+
+def evaluate(policy, env_mode, n_episodes=50, seed_offset=1000):
+    env = RealisticCausalPushEnv(render_mode=None, distribution_mode=env_mode)
+    is_causal = isinstance(policy, CausalDiscoveryPolicy)
+    r = {k: [] for k in ('success', 'final_distance', 'true_friction', 'true_mass',
+                         'friction_est', 'mass_est', 'friction_std', 'mass_std',
+                         'n_probes')}
+    t0 = time.time()
+    for ep in range(n_episodes):
+        obs, _ = env.reset(seed=seed_offset + ep)
+        policy.reset()
+        done = False
+        while not done:
+            action, _ = policy.predict(obs)
+            obs, _, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
+        r['success'].append(bool(info['is_success']))
+        r['final_distance'].append(info['final_distance'])
+        r['true_friction'].append(info['true_base_friction'])
+        r['true_mass'].append(info['true_mass'])
+        if is_causal:
+            b = policy.agent.get_beliefs()
+            r['friction_est'].append(b['friction_mean'])
+            r['mass_est'].append(b['mass_mean'])
+            r['friction_std'].append(b['friction_std'])
+            r['mass_std'].append(b['mass_std'])
+            r['n_probes'].append(policy.n_explore_steps)
+    env.close()
+
+    out = {k: np.array(v) for k, v in r.items()}
+    k = int(out['success'].sum())
+    out['success_rate'] = k / n_episodes
+    out['success_ci'] = wilson_interval(k, n_episodes)
+    out['mean_final_distance'] = out['final_distance'].mean()
+    out['sec_per_episode'] = (time.time() - t0) / n_episodes
+    if is_causal:
+        out['friction_mae'] = np.abs(out['friction_est'] - out['true_friction']).mean()
+        out['mass_mae'] = np.abs(out['mass_est'] - out['true_mass']).mean()
+    return out
+
+
+def run_comparison(n_episodes=50):
+    print("=" * 78)
+    print(f"AGENT COMPARISON ({n_episodes} paired episodes per distribution)")
+    print("=" * 78)
+    agents = build_agents()
+    results = {}
+    for name, factory in agents.items():
+        print(f"\n--- {name} ---")
+        policy = factory()
+        results[name] = {}
+        for mode, label in DISTRIBUTIONS.items():
+            r = evaluate(policy, mode, n_episodes)
+            results[name][mode] = r
+            lo, hi = r['success_ci']
+            line = (f"  {label:7s} success {r['success_rate']*100:5.1f}% "
+                    f"[{lo*100:3.0f}-{hi*100:3.0f}]  final dist "
+                    f"{r['mean_final_distance']*100:5.2f}cm")
+            if 'friction_mae' in r:
+                line += (f"  μ MAE {r['friction_mae']:.3f}  m MAE "
+                         f"{r['mass_mae']:.2f}kg  probes {r['n_probes'].mean():.1f}")
+            print(line + f"  ({r['sec_per_episode']*1000:.0f} ms/ep)")
+
+    print_summary_table(results)
+    plot_comparison(results)
+    return results
+
+
+def print_summary_table(results):
+    names = list(results)
+    print("\n" + "=" * 78)
+    print("SUCCESS RATE (%)")
+    print("=" * 78)
+    print(f"{'':10s}" + "".join(f"{n:>18s}" for n in names))
+    for mode, label in DISTRIBUTIONS.items():
+        print(f"{label:10s}" + "".join(
+            f"{results[n][mode]['success_rate']*100:18.1f}" for n in names))
+
+
+def plot_comparison(results, path='causal_vs_baseline_comparison.png'):
+    names = list(results)
+    modes = list(DISTRIBUTIONS)
+    labels = [DISTRIBUTIONS[m] for m in modes]
+    x = np.arange(len(modes))
+    width = 0.8 / len(names)
+    colors = {'PPO': '#d95f02', 'Model-based RL': '#7570b3',
+              'Causal (passive)': '#1b9e77', 'Causal (active IG)': '#66a61e'}
+
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+
+    # (a) success rate with 95% CI
+    ax = axes[0, 0]
+    for i, n in enumerate(names):
+        rates = np.array([results[n][m]['success_rate'] for m in modes]) * 100
+        ci = np.array([results[n][m]['success_ci'] for m in modes]) * 100
+        err = np.vstack([rates - ci[:, 0], ci[:, 1] - rates])
+        ax.bar(x + (i - (len(names) - 1) / 2) * width, rates, width, yerr=err,
+               capsize=2, label=n, color=colors.get(n))
+    ax.set_ylabel('Success rate (%)'); ax.set_ylim(0, 105)
+    ax.set_title('Task success (95% Wilson CI)')
+    ax.set_xticks(x); ax.set_xticklabels(labels); ax.legend(fontsize=8)
+    ax.grid(True, axis='y', alpha=0.3)
+
+    # (b) final distance
+    ax = axes[0, 1]
+    for i, n in enumerate(names):
+        d = [results[n][m]['mean_final_distance'] * 100 for m in modes]
+        ax.bar(x + (i - (len(names) - 1) / 2) * width, d, width, label=n,
+               color=colors.get(n))
+    ax.axhline(1.0, color='gray', ls='--', lw=1, label='±1cm success zone')
+    ax.set_yscale('log'); ax.set_ylabel('Mean final distance to target (cm)')
+    ax.set_title('Final placement error')
+    ax.set_xticks(x); ax.set_xticklabels(labels); ax.legend(fontsize=8)
+    ax.grid(True, axis='y', alpha=0.3)
+
+    causal = [n for n in names if n.startswith('Causal')]
+
+    # (c) inference MAE
+    ax = axes[1, 0]
+    w = 0.8 / (2 * len(causal))
+    for i, n in enumerate(causal):
+        fm = [results[n][m]['friction_mae'] for m in modes]
+        mm = [results[n][m]['mass_mae'] for m in modes]
+        ax.bar(x + (2 * i - len(causal) + 0.5) * w, fm, w, label=f'{n}: μ MAE',
+               color=colors.get(n))
+        ax.bar(x + (2 * i - len(causal) + 1.5) * w, mm, w, label=f'{n}: m MAE (kg)',
+               color=colors.get(n), alpha=0.5, hatch='//')
+    ax.set_ylabel('Mean absolute error'); ax.set_title('Confounder inference accuracy')
+    ax.set_xticks(x); ax.set_xticklabels(labels); ax.legend(fontsize=7)
+    ax.grid(True, axis='y', alpha=0.3)
+
+    # (d) inferred vs true friction
+    ax = axes[1, 1]
+    markers = ['o', '^']
+    for i, n in enumerate(causal):
+        tf = np.concatenate([results[n][m]['true_friction'] for m in modes])
+        ef = np.concatenate([results[n][m]['friction_est'] for m in modes])
+        ax.scatter(tf, ef, s=18, alpha=0.5, marker=markers[i % 2], label=n,
+                   color=colors.get(n))
+    lims = [0.1, 0.4]
+    ax.plot(lims, lims, 'k--', lw=1, label='perfect inference')
+    ax.set_xlabel('True friction μ'); ax.set_ylabel('Inferred μ (posterior mean)')
+    ax.set_title('Inferred vs true friction (all distributions)')
+    ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+
     plt.tight_layout()
-    plt.savefig('causal_vs_baseline_comparison.png', dpi=150, bbox_inches='tight')
-    print("\n✓ Comparison plot saved as 'causal_vs_baseline_comparison.png'")
+    plt.savefig(path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"\n✓ Comparison plot saved as '{path}'")
+
 
 if __name__ == "__main__":
-    causal_results, baseline_results = run_comparison()
+    run_comparison()
