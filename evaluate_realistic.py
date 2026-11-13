@@ -1,21 +1,20 @@
-import os
 import numpy as np
 import matplotlib.pyplot as plt
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv
-from stable_baselines3.common.monitor import Monitor
 from realistic_causal_env import RealisticCausalPushEnv
 
-def make_env(mode='train'):
-    def _init():
-        env = RealisticCausalPushEnv(render_mode=None, distribution_mode=mode, history_length=3)
-        return Monitor(env)
-    return _init
 
-def evaluate_on_distribution(model, mode, n_episodes=50):
-    """Evaluate model on a specific distribution"""
-    eval_env = DummyVecEnv([make_env(mode)])
-    
+def evaluate_on_distribution(model, mode, n_episodes=50, seed_offset=1000):
+    """Evaluate model on a specific distribution.
+
+    Uses a plain (non-vectorised) env: a DummyVecEnv auto-resets on done, so
+    reading env.mass/base_friction after the last step returned the NEXT
+    episode's freshly sampled confounders. The true confounders are taken from
+    the terminal step's info instead. Episodes are seeded with the same
+    seed_offset as eval_causal_agent.py so results are paired across agents.
+    """
+    env = RealisticCausalPushEnv(render_mode=None, distribution_mode=mode, history_length=3)
+
     successes = []
     rewards = []
     masses = []
@@ -23,33 +22,34 @@ def evaluate_on_distribution(model, mode, n_episodes=50):
     roughnesses = []
     final_distances = []
     applied_forces_list = []
-    
+
     for episode in range(n_episodes):
-        obs = eval_env.reset()
+        obs, _ = env.reset(seed=seed_offset + episode)
         done = False
-        episode_reward = 0
+        episode_reward = 0.0
         episode_forces = []
-        
+
         while not done:
             action, _ = model.predict(obs, deterministic=True)
-            obs, reward, done, info = eval_env.step(action)
-            episode_reward += reward[0]
-            episode_forces.append(info[0]['applied_force'])
-            
-            if done:
-                underlying_env = eval_env.envs[0].env.unwrapped
-                successes.append(info[0].get('is_success', False))
-                masses.append(underlying_env.mass)
-                base_frictions.append(underlying_env.base_friction)
-                roughnesses.append(underlying_env.roughness)
-                final_distances.append(info[0]['final_distance'])
-                applied_forces_list.append(np.mean(episode_forces))
-        
+            obs, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
+            episode_reward += reward
+            episode_forces.append(info['applied_force'])
+
+        successes.append(info['is_success'])
+        masses.append(info['true_mass'])
+        base_frictions.append(info['true_base_friction'])
+        roughnesses.append(info['true_roughness'])
+        final_distances.append(info['final_distance'])
+        applied_forces_list.append(np.mean(episode_forces))
         rewards.append(episode_reward)
-    
-    eval_env.close()
-    
+
+    env.close()
+
     return {
+        'frictions': np.array(base_frictions),
+        'final_distances': np.array(final_distances),
+        'successes': np.array(successes),
         'success_rate': np.mean(successes),
         'mean_reward': np.mean(rewards),
         'std_reward': np.std(rewards),
@@ -76,14 +76,14 @@ def run_full_evaluation():
         print("✓ Model loaded successfully\n")
     except FileNotFoundError:
         print("✗ Model not found! Train the baseline first:")
-        print("  python train_realistic.py")
+        print("  python train.py")
         return
-    
+
     distributions = {
-        'train': 'Training (μ∈[0.22,0.28], m∈[0.8,1.2], r∈[0.2,0.6])',
-        'test_interp': 'Interpolation (μ=0.25, m=1.0, r=0.4)',
-        'test_extrap_high': 'High Friction (μ=0.32, m=1.4, r=0.8)',
-        'test_extrap_low': 'Low Friction (μ=0.18, m=0.6, r=0.1)',
+        'train': 'Training (μ∈[0.22,0.28], m∈[0.8,1.2], r∈[0.2,0.4])',
+        'test_interp': 'Interpolation (μ=0.25, m=1.0, r=0.3)',
+        'test_extrap_high': 'High Friction (μ=0.35, m=1.4, r=0.7)',
+        'test_extrap_low': 'Low Friction (μ=0.15, m=0.6, r=0.1)',
         'test_adversarial': 'Adversarial (μ=0.30, m=0.7, r=0.7)'
     }
     
@@ -188,7 +188,7 @@ def plot_results(results, distributions):
     std_distances = [results[m]['std_final_distance'] * 100 for m in modes]
     axes[0, 1].bar(range(len(modes)), distances, yerr=std_distances, 
                    color=colors, alpha=0.7, capsize=5)
-    axes[0, 1].axhline(y=1.5, color='gray', linestyle='--', label='Success threshold')
+    axes[0, 1].axhline(y=1.0, color='gray', linestyle='--', label='Success threshold (±1cm)')
     axes[0, 1].set_ylabel('Final Distance to Target (cm)')
     axes[0, 1].set_title('Precision Across Distributions')
     axes[0, 1].set_xticks(range(len(modes)))
@@ -235,45 +235,25 @@ def plot_results(results, distributions):
     axes[1, 1].legend()
     axes[1, 1].grid(True, alpha=0.3)
     
-    # Plot 6: Success vs Friction
-    all_frictions = []
-    all_successes = []
-    all_modes_labels = []
-    
+    # Plot 6: per-episode final error vs the episode's true friction
+    # (real episodes; the old version plotted randomly generated points)
     for mode_idx, mode in enumerate(modes):
-        # Approximate distribution
-        n = 50
-        if mode == 'train':
-            frictions_dist = np.random.uniform(0.22, 0.28, n)
-        elif mode == 'test_interp':
-            frictions_dist = np.ones(n) * 0.25
-        elif mode == 'test_extrap_high':
-            frictions_dist = np.ones(n) * 0.32
-        elif mode == 'test_extrap_low':
-            frictions_dist = np.ones(n) * 0.18
-        else:  # adversarial
-            frictions_dist = np.ones(n) * 0.30
-        
-        successes_dist = np.random.binomial(1, results[mode]['success_rate'], n)
-        
-        all_frictions.extend(frictions_dist)
-        all_successes.extend(successes_dist)
-        all_modes_labels.extend([mode_idx] * n)
-    
-    for mode_idx, mode in enumerate(modes):
-        mask = np.array(all_modes_labels) == mode_idx
+        r = results[mode]
         axes[1, 2].scatter(
-            np.array(all_frictions)[mask],
-            np.array(all_successes)[mask],
+            r['frictions'],
+            r['final_distances'] * 100,
             alpha=0.5,
             c=[colors[mode_idx]],
             label=mode,
             s=30
         )
-    
-    axes[1, 2].set_xlabel('Friction Coefficient (μ)')
-    axes[1, 2].set_ylabel('Success (0/1)')
-    axes[1, 2].set_title('Success vs Friction Coefficient')
+    axes[1, 2].axhline(y=1.0, color='gray', linestyle='--')
+    axes[1, 2].set_xlabel('True friction coefficient (μ)')
+    axes[1, 2].set_ylabel('Final distance to target (cm)')
+    axes[1, 2].set_yscale('symlog', linthresh=1.0)
+    max_err = max(results[m]['final_distances'].max() for m in modes) * 100
+    axes[1, 2].set_ylim(0, max(2.0, max_err * 1.5))
+    axes[1, 2].set_title('Per-episode error vs friction')
     axes[1, 2].legend(fontsize=8)
     axes[1, 2].grid(True, alpha=0.3)
     
