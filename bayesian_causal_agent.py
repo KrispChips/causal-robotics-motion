@@ -1,6 +1,24 @@
 """
 Bayesian Causal Agent
 
+What this is (and is not)
+-------------------------
+This agent is GIVEN the causal structure -- which variables cause what, and
+the functional form (Coulomb friction) -- and INFERS the values of the hidden
+confounders within it. In control terms this is Bayesian system
+identification with a known model class. It does not discover the causal
+graph or the equations from data; that is what the PC-algorithm and VAE
+stages of the project plan are for. Results with this agent therefore
+support "structure + inference beats structure-free learning", not "causal
+discovery beats RL".
+
+Its physics model was checked against the same simulator it is evaluated in
+(test_sim_physics.py), so it is close to exact: results are a best case for
+a structured agent. Its hyperparameters (observation noise, planner and
+exploration settings) come from the training distribution only
+(tune_on_train.py); the prior box is fixed a priori and wider than any
+train or test range.
+
 Treats the block's friction (mu) and mass (m) as hidden confounders of the
 force -> motion relationship and infers them from interaction:
 
@@ -102,9 +120,12 @@ class BayesianCausalAgent:
         force_range: the actuator limits (the same action-space information
         PPO gets); candidate forces are spaced force_resolution N apart.
 
-        velocity_noise_std: per-step observation noise on velocity (m/s).
-        Covers model error (~0.003) plus the env's per-step friction
-        resampling, sigma_mu = 0.02*roughness -> sigma_v ~ 0.014 at r = 0.7.
+        velocity_noise_std: per-step observation noise on velocity (m/s),
+        covering model error and the env's per-step friction noise. The
+        default is only a fallback; experiments use the value estimated by
+        empirical Bayes on unlabelled training-distribution data
+        (tune_on_train.py). (It was previously hand-set from the
+        high-friction TEST set's roughness -- a leak, now removed.)
         """
         self.rng = rng if rng is not None else np.random.default_rng()
         self.friction_values = np.linspace(*friction_range, grid_size[0])
@@ -234,10 +255,11 @@ class BayesianCausalAgent:
 
     def choose_exploratory_force(self, x, v, target, n_steps_remaining,
                                  strategy='active', max_candidates=17,
-                                 min_gain=0.05):
+                                 min_gain=0.05, margin=0.02, max_risk=0.01):
         """Return a safe probe force, or None if exploration should stop
         (no safe informative force left)."""
-        safe = self.safe_forces(x, v, target, n_steps_remaining)
+        safe = self.safe_forces(x, v, target, n_steps_remaining,
+                                margin=margin, max_risk=max_risk)
         if len(safe) == 0:
             return None
         if len(safe) > max_candidates:
@@ -305,9 +327,16 @@ class CausalDiscoveryPolicy:
 
     def __init__(self, exploration='none', max_explore_steps=8,
                  friction_tol=0.02, mass_tol=0.05,
-                 max_episode_steps=20, rng=None, **agent_kwargs):
+                 max_episode_steps=20, rng=None, plan_kwargs=None,
+                 explore_kwargs=None, **agent_kwargs):
+        """plan_kwargs -> plan_force (speed_weight, overshoot_weight,
+        recourse_steps); explore_kwargs -> choose_exploratory_force
+        (min_gain, margin, max_risk). Experiments load these from the
+        train-only tuning (tune_on_train.py), see experiment_config."""
         assert exploration in ('none', 'active', 'random')
         self.agent = BayesianCausalAgent(rng=rng, **agent_kwargs)
+        self.plan_kwargs = dict(plan_kwargs or {})
+        self.explore_kwargs = dict(explore_kwargs or {})
         self.exploration = exploration
         self.max_explore_steps = max_explore_steps
         self.friction_tol = friction_tol
@@ -343,13 +372,15 @@ class CausalDiscoveryPolicy:
             if (self.n_explore_steps < self.max_explore_steps
                     and self._still_uncertain()):
                 force = self.agent.choose_exploratory_force(
-                    x, v, target, steps_left, strategy=self.exploration)
+                    x, v, target, steps_left, strategy=self.exploration,
+                    **self.explore_kwargs)
             if force is None:
                 self.exploring = False  # switch to exploitation for good
             else:
                 self.n_explore_steps += 1
         if force is None:
-            force = self.agent.choose_force(x, v, target, steps_left)
+            force = self.agent.choose_force(x, v, target, steps_left,
+                                            **self.plan_kwargs)
 
         self.last_x, self.last_v = x, v
         self.episode_step += 1

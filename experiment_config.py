@@ -50,6 +50,48 @@ def paths(preset):
     return d
 
 
+def agent_config_path(preset):
+    return os.path.join(paths(preset)['models'], 'agent_config.json')
+
+
+def load_agent_config(preset):
+    """Hyperparameters of the planning agents, chosen on the TRAINING
+    distribution only by tune_on_train.py. Keys: velocity_noise_std,
+    causal_plan, causal_explore, mbrl_plan."""
+    import json
+    path = agent_config_path(preset)
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"{path} not found. Run `python tune_on_train.py --preset {preset}` first: "
+            f"agent hyperparameters must come from training-distribution data only.")
+    with open(path) as f:
+        return json.load(f)
+
+
+def make_causal_policy(preset, exploration='none', seed=0, config=None):
+    """The causal push agent with train-tuned hyperparameters."""
+    import numpy as np
+    from bayesian_causal_agent import CausalDiscoveryPolicy
+    cfg = config or load_agent_config(preset)
+    return CausalDiscoveryPolicy(
+        exploration=exploration, rng=np.random.default_rng(seed),
+        force_range=(0.0, PRESETS[preset]['force_max']),
+        velocity_noise_std=cfg['velocity_noise_std'],
+        plan_kwargs=cfg['causal_plan'],
+        explore_kwargs={k: v for k, v in cfg['causal_explore'].items()
+                        if k in ('min_gain', 'margin', 'max_risk')},
+        **{k: v for k, v in cfg['causal_explore'].items()
+           if k in ('friction_tol', 'mass_tol')})
+
+
+def make_mbrl_policy(preset, config=None):
+    from mbrl_baseline import ModelBasedPolicy
+    cfg = config or load_agent_config(preset)
+    return ModelBasedPolicy(paths(preset)['mbrl'],
+                            force_range=(0.0, PRESETS[preset]['force_max']),
+                            plan_kwargs=cfg['mbrl_plan'])
+
+
 def figure(name, preset):
     """'foo.png' -> 'foo.png' (narrow) or 'foo_pdf.png'."""
     stem, ext = os.path.splitext(name)

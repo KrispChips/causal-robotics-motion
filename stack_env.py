@@ -29,7 +29,8 @@ Action:      carry speed in [-1, 1] -> peak acceleration 15%..100% of 13 m/s^2.
 Reward:      10 - task_time (s) if B stands on A after a 2 s stability
              check, else -5. One decision per episode.
 Info:        true confounders, task time, whether the block was dropped
-             ('slipped': moved >3cm in the grip) and the max in-grip slip.
+             ('slipped': lost contact with both fingers for 50 ms) and the
+             max in-grip slip.
 """
 
 import numpy as np
@@ -124,9 +125,6 @@ def holds(mu_block, mass, a_peak, finger_force=FINGER_FORCE, finger_mu=FINGER_MU
     return 2.0 * finger_mu * mu_block * finger_force >= mass * peak_grasp_load(a_peak)
 
 
-DROP_SLIP = 0.03   # m of in-grip sliding after which the block leaves the pads
-
-
 def predicted_slip(mu_block, mass, a_peak, finger_force=FINGER_FORCE,
                    finger_mu=FINGER_MU, n_points=400):
     """Coulomb model of the block sliding down through the fingers.
@@ -138,7 +136,9 @@ def predicted_slip(mu_block, mass, a_peak, finger_force=FINGER_FORCE,
     robot's own planned vertical moves with the block in hand (the
     horizontal carry runs along the fingers' closing axis, so it loads the
     pads in compression, not shear). Vectorised over mu_block / mass.
-    Returns total slip distance (m)."""
+    Returns total slip distance (m). Used to validate the simulator's grasp
+    physics; agents do not use it (they would need to know how much slip
+    the env tolerates, which is the grader's business)."""
     mu_block, mass = np.broadcast_arrays(np.asarray(mu_block, float),
                                          np.asarray(mass, float))
     cap = 2.0 * finger_mu * mu_block * finger_force / mass      # m/s^2
@@ -159,9 +159,6 @@ def predicted_slip(mu_block, mass, a_peak, finger_force=FINGER_FORCE,
         v_rel = np.where(cap > G, 0.0, v_rel)
     return slip
 
-
-def drops(mu_block, mass, a_peak, **kw):
-    return predicted_slip(mu_block, mass, a_peak, **kw) > DROP_SLIP
 
 
 # ------------------------------------------------------------------ push log
@@ -331,12 +328,20 @@ class PandaStackEnv(gym.Env):
             carrying = name in ('lift', 'carry', 'lower')
             if carrying and offset0 is None:
                 offset0 = self._grip_offset()   # where the block sits once gripped
+            no_contact = 0
             for k in range(1, n + 1):
                 self._drive(min_jerk(start, end, k / n), closed)
-                if carrying and k % 4 == 0:
-                    max_slip = max(max_slip,
-                                   float(np.linalg.norm(self._grip_offset() - offset0)))
-                    if max_slip > 0.03:          # block has left the fingers
+                if carrying:
+                    if k % 4 == 0:
+                        max_slip = max(max_slip,
+                                       float(np.linalg.norm(self._grip_offset() - offset0)))
+                    # Dropped = the block has physically left both fingers
+                    # (no contact for 50 ms), not an arbitrary slip distance.
+                    touching = any(p.getContactPoints(self.block_b, self.robot, -1, f,
+                                                      physicsClientId=self.client)
+                                   for f in FINGERS)
+                    no_contact = 0 if touching else no_contact + 1
+                    if no_contact >= 12:
                         slipped = True
                         break
             if slipped:

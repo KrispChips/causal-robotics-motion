@@ -24,7 +24,7 @@ import matplotlib.pyplot as plt
 
 from realistic_causal_env import RealisticCausalPushEnv, PRESETS
 from bayesian_causal_agent import CausalDiscoveryPolicy
-from experiment_config import parse_preset, paths, labels, figure
+from experiment_config import parse_preset, paths, labels, figure, make_causal_policy
 
 STRATEGIES = {'none': 'Passive (exploit only)', 'random': 'Random probes',
               'active': 'Active (info gain)'}
@@ -36,9 +36,7 @@ def run_strategy(strategy, mode, n_episodes=30, seed_offset=1000, preset='narrow
     """Per-step absolute errors, shape (n_episodes, MAX_STEPS). Column t is
     the error after t+1 environment interactions."""
     env = RealisticCausalPushEnv(distribution_mode=mode, preset=preset)
-    policy = CausalDiscoveryPolicy(exploration=strategy,
-                                   rng=np.random.default_rng(0),
-                                   force_range=(env.force_min, env.force_max))
+    policy = make_causal_policy(preset, exploration=strategy)
     f_err = np.zeros((n_episodes, MAX_STEPS))
     m_err = np.zeros((n_episodes, MAX_STEPS))
     success = []

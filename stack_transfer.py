@@ -9,16 +9,20 @@ Agents
   PPO (stack)      - model-free RL, trained on stacking episodes from the
                      training distribution only (raw push log -> carry speed)
   Causal           - push log -> Bayesian posterior over (mu, m) (the same
-                     inference as the push agent) -> Coulomb in-grip slip
-                     model over the robot's own motion plan -> carry speed
-                     maximising expected reward. No stacking training at all.
+                     inference as the push agent) -> friction-cone grasp
+                     condition (textbook: no slip allowed) over the robot's
+                     own motion plan -> carry speed maximising expected
+                     reward. No stacking training at all.
   Fixed fastest    - reference: always carry at the Panda's limit
-  Oracle           - reference: true (mu, m) + the slip model (upper bound)
+  Causal, true μ,m - reference: the same decision rule given the true
+                     (mu, m); the gap to 'Causal' is the cost of inference
 
 What the causal agent is given that PPO is not: the physics *structure*
 (Coulomb friction in pushing and in the grip) and the robot's own constants
 (grip force, pad friction, motion plan). It is never given the train/test
-confounder ranges. PPO gets the same observation and learns everything else.
+confounder ranges, nor the env's drop criterion: it assumes any slip is a
+failure, which is conservative. PPO gets the same observation and learns
+everything else.
 
 Usage
   python stack_transfer.py bank  --preset pdf   # record push logs (train + eval)
@@ -33,7 +37,7 @@ from multiprocessing import Pool
 
 import numpy as np
 
-from experiment_config import parse_preset, paths, labels, figure
+from experiment_config import parse_preset, paths, labels, figure, load_agent_config
 from realistic_causal_env import PRESETS
 import stack_env as S
 
@@ -85,12 +89,13 @@ def load_bank(preset, mode, split):
 class CausalStackPolicy:
     name = 'Causal'
 
-    def __init__(self, force_max, n_samples=512, n_candidates=18, success_reward=10.0,
-                 fail_reward=-5.0, rng=None):
+    def __init__(self, force_max, velocity_noise_std, n_samples=512, n_candidates=18,
+                 success_reward=10.0, fail_reward=-5.0, rng=None):
         from bayesian_causal_agent import BayesianCausalAgent
         self.force_max = force_max
         self.agent = BayesianCausalAgent(rng=rng or np.random.default_rng(0),
-                                         force_range=(0.0, force_max))
+                                         force_range=(0.0, force_max),
+                                         velocity_noise_std=velocity_noise_std)
         self.n_samples = n_samples
         self.cands = np.linspace(S.SPEED_MIN_FRAC * S.A_PEAK_MAX, S.A_PEAK_MAX, n_candidates)
         self.times = np.array([S.task_time(a) for a in self.cands])
@@ -108,7 +113,7 @@ class CausalStackPolicy:
 
     def predict(self, obs, deterministic=True):
         mu_s, m_s = self.infer(obs)
-        p_drop = np.array([S.drops(mu_s, m_s, a).mean() for a in self.cands])
+        p_drop = np.array([1.0 - S.holds(mu_s, m_s, a).mean() for a in self.cands])
         exp_r = (1 - p_drop) * (self.r_succ - self.times) + p_drop * self.r_fail
         i = int(np.argmax(exp_r))
         b = self.agent.get_beliefs()
@@ -118,8 +123,9 @@ class CausalStackPolicy:
 
 
 class OracleStackPolicy:
-    """Knows the true (mu, m); fastest candidate the slip model says is safe."""
-    name = 'Oracle (true μ, m)'
+    """The causal agent's decision rule given the true (mu, m): fastest
+    candidate inside the friction cone."""
+    name = 'Causal, true μ,m'
 
     def __init__(self, n_candidates=18):
         self.cands = np.linspace(S.SPEED_MIN_FRAC * S.A_PEAK_MAX, S.A_PEAK_MAX, n_candidates)
@@ -127,7 +133,7 @@ class OracleStackPolicy:
 
     def predict(self, obs, deterministic=True):
         mu, m = self.env.base_friction, self.env.mass
-        safe = [a for a in self.cands if not S.drops(mu, m, a)]
+        safe = [a for a in self.cands if S.holds(mu, m, a)]
         return S.peak_accel_to_action(max(safe) if safe else self.cands[0]), None
 
 
@@ -188,7 +194,8 @@ def evaluate(preset):
         agents.append(PPOStackPolicy(ppo_path))
     else:
         print(f"  (skipping PPO: {ppo_path} missing -- run: stack_transfer.py train)")
-    agents += [CausalStackPolicy(force_max), FixedSpeedPolicy(), OracleStackPolicy()]
+    sigma = load_agent_config(preset)['velocity_noise_std']   # tuned on train only
+    agents += [CausalStackPolicy(force_max, sigma), FixedSpeedPolicy(), OracleStackPolicy()]
 
     results = {}
     for mode, label in labels(preset).items():

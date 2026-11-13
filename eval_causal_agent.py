@@ -15,13 +15,14 @@ Run train.py and mbrl_baseline.py first (missing baselines are skipped).
 
 import os
 import time
+from multiprocessing import Pool
 import numpy as np
 import matplotlib.pyplot as plt
 
 from realistic_causal_env import RealisticCausalPushEnv, PRESETS
 from bayesian_causal_agent import CausalDiscoveryPolicy
-from mbrl_baseline import ModelBasedPolicy
-from experiment_config import parse_preset, paths, labels, figure
+from experiment_config import (parse_preset, paths, labels, figure, load_agent_config,
+                               make_causal_policy, make_mbrl_policy)
 
 
 class PPOPolicy:
@@ -43,21 +44,19 @@ def build_agents(preset='narrow'):
     range (PPO gets it through its action space, the planners as
     force_range) -- never the train/test confounder ranges."""
     p = paths(preset)
-    force_range = (0.0, PRESETS[preset]['force_max'])
+    cfg = load_agent_config(preset)   # hyperparameters tuned on train only
     agents = {}
     if os.path.exists(p['ppo']):
         agents['PPO'] = lambda: PPOPolicy(p['ppo'])
     else:
         print(f"  (skipping PPO: {p['ppo']} not found -- run train.py --preset {preset})")
     if os.path.exists(p['mbrl']):
-        agents['Model-based RL'] = lambda: ModelBasedPolicy(p['mbrl'], force_range=force_range)
+        agents['Model-based RL'] = lambda: make_mbrl_policy(preset, cfg)
     else:
         print(f"  (skipping model-based RL: {p['mbrl']} not found -- "
               f"run mbrl_baseline.py --preset {preset})")
-    agents['Causal (passive)'] = lambda: CausalDiscoveryPolicy(
-        exploration='none', rng=np.random.default_rng(0), force_range=force_range)
-    agents['Causal (active IG)'] = lambda: CausalDiscoveryPolicy(
-        exploration='active', rng=np.random.default_rng(0), force_range=force_range)
+    agents['Causal (passive)'] = lambda: make_causal_policy(preset, 'none', config=cfg)
+    agents['Causal (active IG)'] = lambda: make_causal_policy(preset, 'active', config=cfg)
     return agents
 
 
@@ -112,6 +111,12 @@ def evaluate(policy, env_mode, n_episodes=50, seed_offset=1000, preset='narrow')
     return out
 
 
+def _eval_job(job):
+    name, mode, n_episodes, preset = job
+    policy = build_agents(preset)[name]()
+    return evaluate(policy, mode, n_episodes, preset=preset)
+
+
 def run_comparison(n_episodes=50, preset='narrow'):
     print("=" * 78)
     print(f"AGENT COMPARISON ({n_episodes} paired episodes per distribution, "
@@ -119,13 +124,17 @@ def run_comparison(n_episodes=50, preset='narrow'):
     print("=" * 78)
     distributions = labels(preset)
     agents = build_agents(preset)
+    # Each (agent, distribution) pair is an independent job (fresh policy,
+    # same seeded episodes in the same order), so run them in parallel.
+    jobs = [(name, mode, n_episodes, preset) for name in agents for mode in distributions]
+    with Pool(min(len(jobs), 14)) as pool:
+        done = dict(zip([(j[0], j[1]) for j in jobs], pool.map(_eval_job, jobs)))
     results = {}
-    for name, factory in agents.items():
+    for name in agents:
         print(f"\n--- {name} ---")
-        policy = factory()
         results[name] = {}
         for mode, label in distributions.items():
-            r = evaluate(policy, mode, n_episodes, preset=preset)
+            r = done[(name, mode)]
             results[name][mode] = r
             lo, hi = r['success_ci']
             line = (f"  {label:7s} success {r['success_rate']*100:5.1f}% "

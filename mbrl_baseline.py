@@ -147,8 +147,10 @@ class ModelBasedPolicy:
     X, VX, TARGET = 0, 2, 4
 
     def __init__(self, model_path=MODEL_PATH, max_episode_steps=20,
-                 force_range=(FORCE_MIN, FORCE_MAX), force_resolution=0.1):
+                 force_range=(FORCE_MIN, FORCE_MAX), force_resolution=0.1,
+                 plan_kwargs=None):
         self.model = DynamicsEnsemble.load(model_path)
+        self.plan_kwargs = dict(plan_kwargs or {})
         self.max_episode_steps = max_episode_steps
         self.force_range = force_range
         f_lo, f_hi = force_range
@@ -164,7 +166,7 @@ class ModelBasedPolicy:
         target = float(observation[self.TARGET])
         force = plan_force(self.model.rollout, x, v, target,
                            self.max_episode_steps - self.episode_step,
-                           self.candidate_forces)
+                           self.candidate_forces, **self.plan_kwargs)
         self.episode_step += 1
         return np.array([force_to_action(force, *self.force_range)],
                         dtype=np.float32), None
