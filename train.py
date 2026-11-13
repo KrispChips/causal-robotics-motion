@@ -7,15 +7,17 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, BaseCallback
 from stable_baselines3.common.monitor import Monitor
 
-from realistic_causal_env import RealisticCausalPushEnv, FORCE_MIN, FORCE_MAX
+from realistic_causal_env import RealisticCausalPushEnv
+from experiment_config import parse_preset, paths
 
-def make_env(rank, mode='train'):
+def make_env(rank, mode='train', preset='narrow'):
     """Create environment factory"""
     def _init():
         env = RealisticCausalPushEnv(
             render_mode=None,
             distribution_mode=mode,
-            history_length=3
+            history_length=3,
+            preset=preset,
         )
         return Monitor(env)
     return _init
@@ -57,13 +59,13 @@ class DetailedLoggingCallback(BaseCallback):
         
         return True
 
-def train_baseline():
+def train_baseline(preset='narrow'):
     """
     IMPROVED: Train baseline RL agent with better monitoring
     """
-    
-    log_dir = "logs_realistic/"
-    models_dir = "models_realistic/"
+
+    log_dir = paths(preset)['logs'] + "/"
+    models_dir = paths(preset)['models'] + "/"
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(models_dir, exist_ok=True)
     
@@ -71,15 +73,18 @@ def train_baseline():
     print("TRAINING BASELINE RL AGENT (IMPROVED)")
     print("="*70)
     print("Environment: Realistic Causal Push (FIXED)")
-    print("Success threshold: ±1.0cm")
-    print(f"Force range: [{FORCE_MIN}, {FORCE_MAX}]N")
+    probe = RealisticCausalPushEnv(preset=preset)
+    print(f"Preset: {preset}")
+    print(f"Success threshold: ±{probe.success_threshold*100:.1f}cm")
+    print(f"Force range: [{probe.force_min}, {probe.force_max}]N")
+    probe.close()
     print("="*70)
     
     # Create training environment
-    env = DummyVecEnv([make_env(0, mode='train')])
-    
+    env = DummyVecEnv([make_env(0, mode='train', preset=preset)])
+
     # Create evaluation environment
-    eval_env = DummyVecEnv([make_env(0, mode='train')])
+    eval_env = DummyVecEnv([make_env(0, mode='train', preset=preset)])
     
     # Callbacks
     eval_callback = EvalCallback(
@@ -151,12 +156,13 @@ def train_baseline():
         print("FINAL MODEL EVALUATION (Training Distribution)")
         print("="*70)
         
-        test_env = RealisticCausalPushEnv(render_mode=None, distribution_mode='train')
+        test_env = RealisticCausalPushEnv(render_mode=None, distribution_mode='train',
+                                          preset=preset)
         successes = []
         distances = []
-        
-        for _ in range(20):
-            obs, _ = test_env.reset()
+
+        for ep in range(20):
+            obs, _ = test_env.reset(seed=ep)
             done = False
             while not done:
                 action, _ = model.predict(obs, deterministic=True)
@@ -181,7 +187,7 @@ def train_baseline():
             print("   - Checking if task is achievable")
         else:
             print("\n✓ Model learned successfully!")
-            print("  Next: python eval_causal_agent.py")
+            print(f"  Next: python eval_causal_agent.py --preset {preset}")
         
     except KeyboardInterrupt:
         print("\n--- Training interrupted ---")
@@ -198,4 +204,4 @@ def train_baseline():
         eval_env.close()
 
 if __name__ == "__main__":
-    train_baseline()
+    train_baseline(parse_preset("Train the PPO baseline").preset)

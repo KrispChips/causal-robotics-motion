@@ -22,23 +22,23 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 
-from realistic_causal_env import RealisticCausalPushEnv
+from realistic_causal_env import RealisticCausalPushEnv, PRESETS
 from bayesian_causal_agent import CausalDiscoveryPolicy
+from experiment_config import parse_preset, paths, labels, figure
 
 STRATEGIES = {'none': 'Passive (exploit only)', 'random': 'Random probes',
               'active': 'Active (info gain)'}
-MODES = {'train': 'Train', 'test_interp': 'Interp', 'test_extrap_high': 'High μ',
-         'test_extrap_low': 'Low μ', 'test_adversarial': 'Adversarial'}
 FRICTION_TOL = 0.02
 MAX_STEPS = 20
 
 
-def run_strategy(strategy, mode, n_episodes=30, seed_offset=1000):
+def run_strategy(strategy, mode, n_episodes=30, seed_offset=1000, preset='narrow'):
     """Per-step absolute errors, shape (n_episodes, MAX_STEPS). Column t is
     the error after t+1 environment interactions."""
-    env = RealisticCausalPushEnv(distribution_mode=mode)
+    env = RealisticCausalPushEnv(distribution_mode=mode, preset=preset)
     policy = CausalDiscoveryPolicy(exploration=strategy,
-                                   rng=np.random.default_rng(0))
+                                   rng=np.random.default_rng(0),
+                                   force_range=(env.force_min, env.force_max))
     f_err = np.zeros((n_episodes, MAX_STEPS))
     m_err = np.zeros((n_episodes, MAX_STEPS))
     success = []
@@ -72,11 +72,11 @@ def steps_to_tolerance(curve, tol):
     return int(hit[0]) + 1 if len(hit) else None
 
 
-def training_cost_summary():
+def training_cost_summary(preset='narrow'):
     print("\n" + "=" * 74)
     print("TRAINING EXPERIENCE NEEDED BEFORE DEPLOYMENT")
     print("=" * 74)
-    path = "logs_realistic/evaluations.npz"
+    path = paths(preset)['evaluations']
     if os.path.exists(path):
         ev = np.load(path)
         succ = ev['successes'].mean(axis=1)
@@ -88,21 +88,23 @@ def training_cost_summary():
         else:
             print("  PPO:            never reached 80% eval success")
     else:
-        print("  PPO:            no logs found (run train.py)")
-    print("  Model-based RL: 1,000 episodes of random-force data (mbrl_baseline.py)")
+        print(f"  PPO:            no logs found (run train.py --preset {preset})")
+    print(f"  Model-based RL: 1,000 episodes of random-force data "
+          f"(mbrl_baseline.py --preset {preset})")
     print("  Causal agent:   0 episodes (physics structure + prior; infers μ, m "
           "within each episode)")
 
 
-def main(n_episodes=30):
+def main(n_episodes=30, preset='narrow'):
     print("=" * 74)
-    print(f"WITHIN-EPISODE IDENTIFICATION ({n_episodes} paired episodes)")
+    print(f"WITHIN-EPISODE IDENTIFICATION ({n_episodes} paired episodes, preset '{preset}')")
     print("=" * 74)
+    MODES = labels(preset)
     curves = {}
     for mode, mlabel in MODES.items():
         print(f"\n{mlabel}:")
         for s, slabel in STRATEGIES.items():
-            f_err, m_err, succ = run_strategy(s, mode, n_episodes)
+            f_err, m_err, succ = run_strategy(s, mode, n_episodes, preset=preset)
             curves[(mode, s)] = (f_err.mean(0), m_err.mean(0))
             k = steps_to_tolerance(f_err.mean(0), FRICTION_TOL)
             print(f"  {slabel:24s} μ err after 3/5/20 steps: "
@@ -128,12 +130,15 @@ def main(n_episodes=30):
     axes[0, 0].legend(fontsize=8)
     plt.suptitle('Confounder identification vs. number of interactions')
     plt.tight_layout()
-    plt.savefig('sample_efficiency.png', dpi=150, bbox_inches='tight')
+    out_png = figure('sample_efficiency.png', preset)
+    plt.savefig(out_png, dpi=150, bbox_inches='tight')
     plt.close(fig)
-    print("\n✓ Plot saved as 'sample_efficiency.png'")
+    print(f"\n✓ Plot saved as '{out_png}'")
 
-    training_cost_summary()
+    training_cost_summary(preset)
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_preset("Within-episode identification / sample efficiency",
+                        extra_args=[(('--episodes',), dict(type=int, default=30))])
+    main(args.episodes, args.preset)

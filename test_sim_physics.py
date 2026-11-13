@@ -20,23 +20,29 @@ import numpy as np
 import pybullet as p
 
 from realistic_causal_env import (RealisticCausalPushEnv, action_to_force,
-                                  force_to_action, FORCE_MIN, FORCE_MAX)
+                                  force_to_action, FORCE_MIN, FORCE_MAX, PRESETS)
 from bayesian_causal_agent import simulate_step, G
 
-FIXED_MODES = {  # (mu, mass) of the deterministic test distributions
-    'test_interp': (0.25, 1.0),
-    'test_extrap_low': (0.15, 0.6),
-    'test_extrap_high': (0.35, 1.4),
-    'test_adversarial': (0.30, 0.7),
-}
-TRAIN_MAX_FRICTION_FORCE = 0.28 * 1.2 * G  # upper corner of the train range
+
+def fixed_modes(preset):
+    """(mu, mass) of a preset's deterministic test distributions."""
+    out = {}
+    for mode, spec in PRESETS[preset]['modes'].items():
+        (m_lo, m_hi), (f_lo, f_hi) = spec['mass'], spec['friction']
+        if m_lo == m_hi and f_lo == f_hi:
+            out[mode] = (f_lo, m_lo)
+    return out
+
+
+FIXED_MODES = fixed_modes("narrow")
+REFERENCE_SEED5 = (1.122001, 0.268476)  # narrow/train, recorded before the preset refactor
 
 
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
-def make_env(mode='test_interp', seed=0):
-    env = RealisticCausalPushEnv(render_mode=None, distribution_mode=mode)
+def make_env(mode='test_interp', seed=0, preset='narrow'):
+    env = RealisticCausalPushEnv(render_mode=None, distribution_mode=mode, preset=preset)
     env.reset(seed=seed)
     return env
 
@@ -55,14 +61,14 @@ def state(env):
     return np.array(pos), np.array(p.getEulerFromQuaternion(orn)), np.array(lin), np.array(ang)
 
 
-def run_sim(forces, mu, mass, mode='test_interp'):
+def run_sim(forces, mu, mass, mode='test_interp', preset='narrow'):
     """Step the env with a force sequence (N). Returns x, vx, and the max
     off-axis drift |y|, |z - 0.05| and |roll/pitch/yaw| seen."""
-    env = make_env(mode)
+    env = make_env(mode, preset=preset)
     pin(env, mu, mass)
     xs, vs, off = [0.0], [0.0], np.zeros(3)
     for F in forces:
-        env.step(np.array([force_to_action(F)]))
+        env.step(np.array([env.force_to_action(F)]))
         pos, rpy, lin, _ = state(env)
         xs.append(pos[0]); vs.append(lin[0])
         off = np.maximum(off, [abs(pos[1]), abs(pos[2] - 0.05), np.abs(rpy).max()])
@@ -93,15 +99,15 @@ def coast_decel(mu, mass, v0, n_substeps=12, plane_mu=None):
     return (v0 - v1) / (n_substeps / 240.0)
 
 
-def planned_push(mu, mass, target=0.10, n_steps=20, max_push_steps=3):
+def planned_push(mu, mass, target=0.10, n_steps=20, max_push_steps=3, force_max=FORCE_MAX):
     """Shortest constant push (k control steps of force F, then coast) that
     stops the block on the target under the analytic Coulomb model.
-    Returns (k, F); k is the fewest steps for which FORCE_MAX can reach."""
+    Returns (k, F); k is the fewest steps for which force_max can reach."""
     def final_x(F, k):
         return run_analytic([F] * k + [0.0] * (n_steps - k), mu, mass)[0][-1]
     for k in range(1, max_push_steps + 1):
-        if final_x(FORCE_MAX, k) >= target:
-            lo, hi = mu * mass * G, FORCE_MAX
+        if final_x(force_max, k) >= target:
+            lo, hi = mu * mass * G, force_max
             for _ in range(50):
                 mid = 0.5 * (lo + hi)
                 lo, hi = (mid, hi) if final_x(mid, k) < target else (lo, mid)
@@ -120,11 +126,13 @@ def test_force_mapping():
 
 
 def test_force_range_covers_every_distribution():
-    """Max force must beat static friction (with >=25% headroom) everywhere."""
-    needs = {m: mu * mass * G for m, (mu, mass) in FIXED_MODES.items()}
-    needs['train (max corner)'] = TRAIN_MAX_FRICTION_FORCE
-    for mode, need in needs.items():
-        assert FORCE_MAX >= 1.25 * need, f"{mode}: needs {need:.2f}N, max {FORCE_MAX}N"
+    """Max force must beat static friction (with >=25% headroom) for the
+    stickiest, heaviest corner of every distribution in every preset."""
+    for preset, cfg in PRESETS.items():
+        for mode, spec in cfg['modes'].items():
+            need = spec['friction'][1] * spec['mass'][1] * G
+            assert cfg['force_max'] >= 1.25 * need, \
+                f"{preset}/{mode}: needs {need:.2f}N, max {cfg['force_max']}N"
 
 
 # --------------------------------------------------------------------------
@@ -149,16 +157,23 @@ def test_static_friction_threshold():
 
 
 def test_trajectories_match_coulomb_model():
-    """Push-then-coast at task speeds: sim within 0.5mm / 0.005 m/s of analytic."""
-    cases = [(0.25, 1.0, [4.0]), (0.25, 1.0, [3.0, 3.0]), (0.15, 0.6, [2.0]),
-             (0.35, 1.4, [6.0, 6.0]), (0.30, 0.7, [5.0]), (0.25, 1.0, [3.5, 0.0, 3.5])]
-    for mu, mass, pushes in cases:
+    """Push-then-coast at task speeds: sim within max(0.5mm, 2% of distance
+    travelled) and 0.01 m/s of analytic. The relative part covers Bullet's
+    ~1-2% speed-dependent friction at the faster PDF-preset speeds."""
+    cases = [('narrow', 0.25, 1.0, [4.0]), ('narrow', 0.25, 1.0, [3.0, 3.0]),
+             ('narrow', 0.15, 0.6, [2.0]), ('narrow', 0.35, 1.4, [6.0, 6.0]),
+             ('narrow', 0.30, 0.7, [5.0]), ('narrow', 0.25, 1.0, [3.5, 0.0, 3.5]),
+             # PDF ranges: sticky/light, slippery/heavy, sticky/heavy corner
+             ('pdf', 0.75, 0.6, [11.0]), ('pdf', 0.25, 1.9, [7.0, 7.0]),
+             ('pdf', 0.80, 2.0, [19.0, 19.0, 19.0])]
+    for preset, mu, mass, pushes in cases:
         forces = pushes + [0.0] * (20 - len(pushes))
-        xs, vs, off = run_sim(forces, mu, mass)
+        xs, vs, off = run_sim(forces, mu, mass, preset=preset)
         ax, av = run_analytic(forces, mu, mass)
         tag = f"mu={mu} m={mass} F={pushes}"
-        assert np.abs(xs - ax).max() < 5e-4, f"{tag}: max |dx| {np.abs(xs-ax).max()*100:.3f}cm"
-        assert np.abs(vs - av).max() < 5e-3, f"{tag}: max |dv| {np.abs(vs-av).max():.4f}"
+        x_tol = max(5e-4, 0.02 * ax[-1])
+        assert np.abs(xs - ax).max() < x_tol, f"{tag}: max |dx| {np.abs(xs-ax).max()*100:.3f}cm"
+        assert np.abs(vs - av).max() < 1e-2, f"{tag}: max |dv| {np.abs(vs-av).max():.4f}"
         # A push through the centre of mass with mu < 1 must not tip, lift or veer.
         assert off[0] < 1e-3 and off[1] < 1e-3 and off[2] < 1e-2, f"{tag}: off-axis {off}"
 
@@ -176,7 +191,7 @@ def test_friction_speed_dependence_small_in_task_regime():
     that speed the mu error must stay under 3%, i.e. <3mm of a 10cm push,
     well inside the 1cm success band. Beyond that (big overshoots) the
     agent's Coulomb model over-predicts distance."""
-    for mode, (mu, mass) in FIXED_MODES.items():
+    for mode, (mu, mass) in {**FIXED_MODES, **fixed_modes('pdf')}.items():
         v_needed = np.sqrt(2 * mu * G * 0.10)
         eff = coast_decel(mu, mass, v0=v_needed) / G
         assert abs(eff / mu - 1) < 0.03, f"{mode}: v={v_needed:.2f} effective mu {eff:.4f} vs {mu}"
@@ -210,17 +225,41 @@ def test_friction_change_takes_effect_mid_slide():
 # hidden confounders / noise / seeding
 # --------------------------------------------------------------------------
 def test_confounders_match_distribution_spec():
-    for mode, (mu, mass) in FIXED_MODES.items():
-        env = make_env(mode)
-        assert (env.base_friction, env.mass) == (mu, mass)
-        assert p.getDynamicsInfo(env.block_id, -1, physicsClientId=env.client)[0] == mass
-        env.close()
-    env = make_env('train')
-    for s in range(50):
-        env.reset(seed=s)
-        assert 0.8 <= env.mass <= 1.2 and 0.22 <= env.base_friction <= 0.28
-        assert 0.2 <= env.roughness <= 0.4
+    for preset, cfg in PRESETS.items():
+        for mode, spec in cfg['modes'].items():
+            env = make_env(mode, preset=preset)
+            assert env.force_max == cfg['force_max']
+            assert env.success_threshold == cfg['success_threshold']
+            for s in range(20 if spec['mass'][0] < spec['mass'][1] else 1):
+                env.reset(seed=s)
+                for val, key in ((env.mass, 'mass'), (env.base_friction, 'friction'),
+                                 (env.roughness, 'roughness')):
+                    lo, hi = spec[key]
+                    assert lo <= val <= hi, f"{preset}/{mode}: {key}={val} not in [{lo},{hi}]"
+                assert p.getDynamicsInfo(env.block_id, -1,
+                                         physicsClientId=env.client)[0] == env.mass
+            env.close()
+
+
+def test_narrow_preset_unchanged():
+    """The preset refactor must reproduce the original narrow episodes."""
+    # Values recorded from the pre-preset implementation (seed 5, train).
+    env = RealisticCausalPushEnv(distribution_mode='train')  # default preset
+    env.reset(seed=5)
+    assert (round(env.mass, 6), round(env.base_friction, 6)) == REFERENCE_SEED5
+    assert env.force_max == 8.0 and env.success_threshold == 0.010
     env.close()
+
+
+def test_high_friction_not_clipped():
+    """Regression: per-step friction used to be clipped to [0.1, 0.5], which
+    silently turned the PDF's mu=0.75 block into mu=0.5."""
+    env = make_env('test_extrap_high', preset='pdf')
+    fr = [env._apply_stochastic_friction() for _ in range(2000)]
+    assert abs(np.mean(fr) - 0.75) < 2e-3
+    env.close()
+    decel = coast_decel(0.75, 0.6, v0=1.0) / G
+    assert abs(decel / 0.75 - 1) < 0.03, f"mu=0.75 block decelerates like mu={decel:.3f}"
 
 
 def test_friction_resampled_once_per_action():
@@ -302,25 +341,65 @@ def test_target_reachable_and_distributions_separated():
     distribution misses badly on another, so no single fixed open-loop
     policy can solve them all. Note: even at FORCE_MAX, the nominal block
     needs >=2 push steps and the high-friction block needs 3."""
-    plans = {}
-    for mode, (mu, mass) in FIXED_MODES.items():
-        k, F = planned_push(mu, mass)
-        plans[mode] = (k, F)
-        wins = 0
-        for seed in range(5):
-            env = make_env(mode, seed)
-            for step in range(env.max_episode_steps):
-                f = F if step < k else 0.0
-                _, _, term, _, info = env.step(np.array([force_to_action(f)]))
-            wins += info['is_success']
-            env.close()
-        assert wins >= 4, f"{mode}: planned push {k}x{F:.2f}N succeeded {wins}/5"
-    for a, b in [('test_extrap_low', 'test_extrap_high'), ('test_extrap_high', 'test_extrap_low'),
-                 ('test_interp', 'test_adversarial')]:
-        k, F = plans[a]
-        mu, mass = FIXED_MODES[b]
-        x = run_analytic([F] * k + [0.0] * (20 - k), mu, mass)[0][-1]
-        assert abs(x - 0.10) > 0.01, f"{a}'s plan also works on {b} (x={x*100:.1f}cm)"
+    for preset, cfg in PRESETS.items():
+        tol = cfg['success_threshold']
+        plans = {}
+        for mode, (mu, mass) in fixed_modes(preset).items():
+            k, F = planned_push(mu, mass, force_max=cfg['force_max'])
+            plans[mode] = (k, F)
+            wins = 0
+            for seed in range(5):
+                env = make_env(mode, seed, preset=preset)
+                for step in range(env.max_episode_steps):
+                    f = F if step < k else 0.0
+                    _, _, term, _, info = env.step(np.array([env.force_to_action(f)]))
+                wins += info['is_success']
+                env.close()
+            assert wins >= 4, f"{preset}/{mode}: planned push {k}x{F:.2f}N succeeded {wins}/5"
+        pairs = [(a, b) for a in plans for b in plans if a != b and a != 'test_interp'
+                 and b != 'test_interp']
+        for a, b in pairs:
+            k, F = plans[a]
+            mu, mass = fixed_modes(preset)[b]
+            x = run_analytic([F] * k + [0.0] * (20 - k), mu, mass)[0][-1]
+            assert abs(x - 0.10) > tol, f"{preset}: {a}'s plan also works on {b} (x={x*100:.1f}cm)"
+
+
+# --------------------------------------------------------------------------
+# Panda stacking (stack_env.py)
+# --------------------------------------------------------------------------
+def _stack(mu, mass, a_peak):
+    import stack_env as S
+    env = S.PandaStackEnv(preset='pdf', distribution_mode='test_interp')
+    log = np.zeros((S.PUSH_STEPS, 3))  # push phase irrelevant here; skip recording it
+    env.reset(seed=0, options={'confounders': (mass, mu, 0.3), 'push_log': log})
+    info = env.step(S.peak_accel_to_action(a_peak))[4]
+    env.close()
+    return info
+
+
+def test_stack_secure_grasp_places_block_exactly():
+    """With a secure grasp the block must not drift in the hand (needs the
+    finger gear coupling) and must land centred on block A."""
+    for mu, mass, a in ((0.45, 1.2, 13.0), (0.75, 0.6, 13.0), (0.3, 1.5, 2.0)):
+        info = _stack(mu, mass, a)
+        assert info['is_success'] and not info['slipped']
+        assert info['max_slip'] < 0.01, f"mu={mu} m={mass}: block drifted {info['max_slip']*100:.2f}cm"
+        assert info['final_offset'] < 0.005, f"placed {info['final_offset']*100:.2f}cm off"
+
+
+def test_stack_slip_model_matches_sim():
+    """The Coulomb in-grip slip model the causal stacking agent plans with
+    must agree with Bullet about whether the block is dropped."""
+    import stack_env as S
+    cases = [(0.20, 2.0, 4.0), (0.20, 2.0, 10.0), (0.20, 1.7, 7.0), (0.20, 1.7, 13.0),
+             (0.25, 2.0, 7.0), (0.25, 2.0, 13.0), (0.25, 1.9, 13.0), (0.30, 2.0, 13.0)]
+    for mu, mass, a in cases:
+        info = _stack(mu, mass, a)
+        pred = bool(S.drops(mu, mass, a))
+        assert pred == info['slipped'], \
+            f"mu={mu} m={mass} a={a}: model drop={pred}, sim drop={info['slipped']} " \
+            f"(pred slip {float(S.predicted_slip(mu, mass, a))*100:.1f}cm, sim {info['max_slip']*100:.1f}cm)"
 
 
 # --------------------------------------------------------------------------

@@ -9,6 +9,8 @@ logs_realistic/
 models_realistic/
 logs_realistic_old_dec2025/
 models_realistic_old_dec2025/
+logs_pdf/
+models_pdf/
 
 # Virtual environments (modify if yours is named differently)
 venv/

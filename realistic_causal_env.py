@@ -5,20 +5,58 @@ import pybullet_data
 from gymnasium import spaces
 import time
 
-# Action -> force mapping. Shared by the env, the causal agent and the eval
-# scripts so they can never disagree about what an action means.
+# Default ('narrow' preset) action -> force mapping. Kept as module constants
+# for backwards compatibility; envs carry their own limits (env.force_min /
+# env.force_max) and agents must read them from the env they act in.
 FORCE_MIN = 0.0   # N  (0 lets the block coast/brake on friction alone)
 FORCE_MAX = 8.0   # N  (high-friction test block needs > 0.35*1.4*9.8 = 4.8N)
 
 
-def action_to_force(action):
+def action_to_force(action, force_min=FORCE_MIN, force_max=FORCE_MAX):
     a = float(np.clip(action, -1.0, 1.0))
-    return FORCE_MIN + (a + 1.0) * 0.5 * (FORCE_MAX - FORCE_MIN)
+    return force_min + (a + 1.0) * 0.5 * (force_max - force_min)
 
 
-def force_to_action(force):
-    a = 2.0 * (force - FORCE_MIN) / (FORCE_MAX - FORCE_MIN) - 1.0
+def force_to_action(force, force_min=FORCE_MIN, force_max=FORCE_MAX):
+    a = 2.0 * (force - force_min) / (force_max - force_min) - 1.0
     return float(np.clip(a, -1.0, 1.0))
+
+
+# Distribution presets. Each mode gives (lo, hi) ranges for mass (kg), base
+# friction and roughness; lo == hi means a fixed value (no RNG draw, so seeds
+# reproduce exactly the episodes of the original implementation).
+PRESETS = {
+    # Original narrow setup: small friction range, 8N actuator, +-1cm.
+    'narrow': {
+        'force_max': 8.0,
+        'success_threshold': 0.010,
+        'modes': {
+            'train':            {'mass': (0.8, 1.2), 'friction': (0.22, 0.28), 'roughness': (0.2, 0.4)},
+            'test_interp':      {'mass': (1.0, 1.0), 'friction': (0.25, 0.25), 'roughness': (0.30, 0.30)},
+            'test_extrap_high': {'mass': (1.4, 1.4), 'friction': (0.35, 0.35), 'roughness': (0.7, 0.7)},
+            'test_extrap_low':  {'mass': (0.6, 0.6), 'friction': (0.15, 0.15), 'roughness': (0.1, 0.1)},
+            # high friction + LOW mass: breaks the "heavy = sticky" intuition
+            'test_adversarial': {'mass': (0.7, 0.7), 'friction': (0.30, 0.30), 'roughness': (0.7, 0.7)},
+        },
+    },
+    # Project plan (PDF Phase 3): mu in [0.2, 0.8], m in [0.5, 2.0] overall,
+    # F in [0, 20N], success zone +-2cm. Roughness is not in the PDF; it keeps
+    # the same role (per-step friction noise) as in the narrow preset.
+    'pdf': {
+        'force_max': 20.0,
+        'success_threshold': 0.020,
+        'modes': {
+            'train':            {'mass': (0.8, 1.5), 'friction': (0.30, 0.60), 'roughness': (0.2, 0.4)},
+            'test_interp':      {'mass': (1.2, 1.2), 'friction': (0.45, 0.45), 'roughness': (0.30, 0.30)},
+            # "very sticky, very light"
+            'test_extrap_high': {'mass': (0.6, 0.6), 'friction': (0.75, 0.75), 'roughness': (0.7, 0.7)},
+            # "very slippery, very heavy"
+            'test_extrap_low':  {'mass': (1.9, 1.9), 'friction': (0.25, 0.25), 'roughness': (0.1, 0.1)},
+            # whole physical range, for success vs. distance-from-training plots
+            'test_full_range':  {'mass': (0.5, 2.0), 'friction': (0.20, 0.80), 'roughness': (0.0, 1.0)},
+        },
+    },
+}
 
 
 class RealisticCausalPushEnv(gym.Env):
@@ -41,11 +79,22 @@ class RealisticCausalPushEnv(gym.Env):
     
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
 
-    def __init__(self, render_mode=None, distribution_mode='train', history_length=3):
+    def __init__(self, render_mode=None, distribution_mode='train', history_length=3,
+                 preset='narrow', block_size=0.10):
         super().__init__()
+        assert preset in PRESETS, f"preset must be one of {list(PRESETS)}"
+        self.preset = preset
+        self._preset = PRESETS[preset]
+        assert distribution_mode in self._preset['modes'],             f"{preset} preset modes: {list(self._preset['modes'])}"
         self.render_mode = render_mode
         self.distribution_mode = distribution_mode
         self.history_length = history_length
+        self.force_min = 0.0
+        self.force_max = self._preset['force_max']
+        # Cube edge (m). Sliding under Coulomb friction does not depend on
+        # size, so a smaller block (e.g. the 6cm stacking block) can be probed
+        # with the same task.
+        self.block_half = block_size / 2.0
         
         # ACTION SPACE: Normalized force [-1, 1]
         self.action_space = spaces.Box(low=-1, high=1, shape=(1,), dtype=np.float32)
@@ -64,7 +113,7 @@ class RealisticCausalPushEnv(gym.Env):
         
         # PHYSICS CONFIGURATION
         self.target_dist = 0.1  # 10cm target
-        self.success_threshold = 0.010  # TIGHTENED: ±1cm (was ±2cm)
+        self.success_threshold = self._preset['success_threshold']
         self.sim_freq = 240.0
         self.policy_freq = 10.0
         self.sim_steps_per_action = int(self.sim_freq / self.policy_freq)
@@ -98,60 +147,32 @@ class RealisticCausalPushEnv(gym.Env):
         self.friction_std = 0.01
 
     def set_distribution_mode(self, mode):
-        """Switch between train/test distributions"""
-        valid_modes = ['train', 'test_interp', 'test_extrap_high', 
-                      'test_extrap_low', 'test_adversarial']
+        """Switch between this preset's train/test distributions"""
+        valid_modes = list(self._preset['modes'])
         assert mode in valid_modes, f"Mode must be one of {valid_modes}"
         self.distribution_mode = mode
 
+    def action_to_force(self, action):
+        return action_to_force(action, self.force_min, self.force_max)
+
+    def force_to_action(self, force):
+        return force_to_action(force, self.force_min, self.force_max)
+
     def _sample_confounders(self):
         """
-        Sample realistic physical confounders based on distribution mode.
-        
+        Sample the hidden physical confounders for this episode.
+
         Returns:
             mass: Object mass in kg
             base_friction: Mean friction coefficient
             roughness: Surface roughness (0=smooth, 1=rough)
         """
-        if self.distribution_mode == 'train':
-            # Training: Narrow range of "typical" blocks
-            mass = self.np_random.uniform(0.8, 1.2)
-            base_friction = self.np_random.uniform(0.22, 0.28)
-            roughness = self.np_random.uniform(0.2, 0.4)  # REDUCED variance (was 0.5)
-            
-        elif self.distribution_mode == 'test_interp':
-            # Interpolation: Middle of training range
-            mass = 1.0
-            base_friction = 0.25
-            roughness = 0.30
-            
-        elif self.distribution_mode == 'test_extrap_high':
-            # High friction: Heavy, rough, sticky block
-            mass = 1.4  # INCREASED from 1.3
-            base_friction = 0.35  # INCREASED from 0.30
-            roughness = 0.7
-            
-        elif self.distribution_mode == 'test_extrap_low':
-            # Low friction: Light, smooth, slippery block
-            mass = 0.6
-            base_friction = 0.15  # DECREASED from 0.18
-            roughness = 0.1
-            
-        elif self.distribution_mode == 'test_adversarial':
-            # Adversarial: Breaks training correlations
-            # In training: high friction often paired with high mass
-            # Here: high friction + LOW mass (misleading)
-            mass = 0.7  # Light
-            base_friction = 0.30  # High friction
-            roughness = 0.7
-            
-        else:
-            # Fallback: Wide range
-            mass = self.np_random.uniform(0.6, 1.4)
-            base_friction = self.np_random.uniform(0.18, 0.32)
-            roughness = self.np_random.uniform(0.0, 1.0)
-            
-        return mass, base_friction, roughness
+        spec = self._preset['modes'][self.distribution_mode]
+        values = []
+        for key in ('mass', 'friction', 'roughness'):
+            lo, hi = spec[key]
+            values.append(lo if lo == hi else self.np_random.uniform(lo, hi))
+        return tuple(values)
 
     def _apply_stochastic_friction(self):
         """
@@ -162,7 +183,9 @@ class RealisticCausalPushEnv(gym.Env):
         # Roughness determines variance
         friction_std = self.roughness * 0.02
         actual_friction = self.np_random.normal(self.base_friction, friction_std)
-        actual_friction = np.clip(actual_friction, 0.1, 0.5)
+        # Floor keeps friction physical; no artificial ceiling (the old 0.5
+        # cap would silently clip the PDF's mu up to 0.8).
+        actual_friction = max(actual_friction, 0.02)
         
         p.changeDynamics(
             self.block_id, -1,
@@ -189,17 +212,17 @@ class RealisticCausalPushEnv(gym.Env):
         # Create block (10cm cube)
         col_shape = p.createCollisionShape(
             p.GEOM_BOX, 
-            halfExtents=[0.05, 0.05, 0.05],
+            halfExtents=[self.block_half] * 3,
             physicsClientId=self.client
         )
         vis_shape = p.createVisualShape(
             p.GEOM_BOX,
-            halfExtents=[0.05, 0.05, 0.05],
+            halfExtents=[self.block_half] * 3,
             rgbaColor=[0.2, 0.6, 0.8, 1],
             physicsClientId=self.client
         )
         
-        start_pos = [0, 0, 0.05]
+        start_pos = [0, 0, self.block_half]
         self.block_id = p.createMultiBody(
             baseMass=1.0,  # Will be changed by confounders
             baseCollisionShapeIndex=col_shape,
@@ -222,7 +245,12 @@ class RealisticCausalPushEnv(gym.Env):
         )
         
         # Sample hidden confounders
-        self.mass, self.base_friction, self.roughness = self._sample_confounders()
+        # options={'confounders': (mass, friction, roughness)} pins the hidden
+        # properties (used to probe a specific object, e.g. before stacking it).
+        if options and 'confounders' in options:
+            self.mass, self.base_friction, self.roughness = options['confounders']
+        else:
+            self.mass, self.base_friction, self.roughness = self._sample_confounders()
         
         # Apply mass
         p.changeDynamics(self.block_id, -1, mass=self.mass, physicsClientId=self.client)
@@ -259,7 +287,7 @@ class RealisticCausalPushEnv(gym.Env):
         else:
             act = action
         
-        force_mag = action_to_force(act)
+        force_mag = self.action_to_force(act)
 
         # Friction is resampled once per action (roughness = per-step noise)
         self.current_friction = self._apply_stochastic_friction()
@@ -314,7 +342,7 @@ class RealisticCausalPushEnv(gym.Env):
         self.prev_dist = dist_to_target
 
         # Small effort cost (tie-breaker, can't dominate the task reward)
-        reward -= 0.01 * (force_mag / FORCE_MAX) ** 2
+        reward -= 0.01 * (force_mag / self.force_max) ** 2
 
         # Terminal bonus for a block resting in the target zone
         if terminated and success:

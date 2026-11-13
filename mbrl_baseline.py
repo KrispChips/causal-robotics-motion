@@ -24,24 +24,26 @@ import torch
 from realistic_causal_env import (RealisticCausalPushEnv, FORCE_MIN, FORCE_MAX,
                                   force_to_action)
 from bayesian_causal_agent import plan_force
+from experiment_config import parse_preset, paths, modes
 
 MODEL_PATH = "models_realistic/mbrl_ensemble.npz"
 
 
 # ---------------------------------------------------------------- data
-def collect_transitions(mode='train', n_episodes=1000, p_zero=0.4, seed=0):
+def collect_transitions(mode='train', n_episodes=1000, p_zero=0.4, seed=0,
+                        preset='narrow'):
     """Random-force interaction data. Force is 0 with prob p_zero (so the
     model sees coasting/braking), otherwise uniform over the force range."""
-    env = RealisticCausalPushEnv(distribution_mode=mode)
+    env = RealisticCausalPushEnv(distribution_mode=mode, preset=preset)
     rng = np.random.default_rng(seed)
     rows = []
     for ep in range(n_episodes):
         obs, _ = env.reset(seed=seed * 100000 + ep)
         for _ in range(env.max_episode_steps):
-            F = 0.0 if rng.random() < p_zero else rng.uniform(FORCE_MIN, FORCE_MAX)
+            F = 0.0 if rng.random() < p_zero else rng.uniform(env.force_min, env.force_max)
             x, v = obs[0], obs[2]
             obs, _, terminated, truncated, info = env.step(
-                np.array([force_to_action(F)]))
+                np.array([env.force_to_action(F)]))
             rows.append((v, info['applied_force'], obs[0] - x, obs[2]))
             if terminated or truncated:
                 break
@@ -145,10 +147,13 @@ class ModelBasedPolicy:
     X, VX, TARGET = 0, 2, 4
 
     def __init__(self, model_path=MODEL_PATH, max_episode_steps=20,
-                 n_candidate_forces=81):
+                 force_range=(FORCE_MIN, FORCE_MAX), force_resolution=0.1):
         self.model = DynamicsEnsemble.load(model_path)
         self.max_episode_steps = max_episode_steps
-        self.candidate_forces = np.linspace(FORCE_MIN, FORCE_MAX, n_candidate_forces)
+        self.force_range = force_range
+        f_lo, f_hi = force_range
+        self.candidate_forces = np.linspace(
+            f_lo, f_hi, int(round((f_hi - f_lo) / force_resolution)) + 1)
         self.reset()
 
     def reset(self):
@@ -161,7 +166,8 @@ class ModelBasedPolicy:
                            self.max_episode_steps - self.episode_step,
                            self.candidate_forces)
         self.episode_step += 1
-        return np.array([force_to_action(force)], dtype=np.float32), None
+        return np.array([force_to_action(force, *self.force_range)],
+                        dtype=np.float32), None
 
 
 # ---------------------------------------------------------------- main
@@ -172,22 +178,23 @@ def one_step_error(model, data):
 
 
 if __name__ == "__main__":
+    preset = parse_preset("Train the model-based RL baseline").preset
+    model_path = paths(preset)['mbrl']
     print("=" * 70)
-    print("MODEL-BASED RL BASELINE: learn dynamics on training distribution")
+    print(f"MODEL-BASED RL BASELINE: learn dynamics on training distribution ({preset})")
     print("=" * 70)
     t0 = time.time()
-    data = collect_transitions('train', n_episodes=1000, seed=0)
+    data = collect_transitions('train', n_episodes=1000, seed=0, preset=preset)
     print(f"Collected {len(data)} transitions from 1000 training episodes "
           f"({time.time() - t0:.0f}s)")
 
     print("Training 5-member ensemble...")
     model = DynamicsEnsemble.train(data)
-    model.save(MODEL_PATH)
-    print(f"Saved: {MODEL_PATH}")
+    model.save(model_path)
+    print(f"Saved: {model_path}")
 
     print("\nOne-step prediction error (mean abs) by distribution:")
-    for mode in ['train', 'test_interp', 'test_extrap_high', 'test_extrap_low',
-                 'test_adversarial']:
-        held_out = collect_transitions(mode, n_episodes=50, seed=1)
+    for mode in modes(preset):
+        held_out = collect_transitions(mode, n_episodes=50, seed=1, preset=preset)
         ex, ev = one_step_error(model, held_out)
         print(f"  {mode:17s} dx {ex*1000:6.2f} mm   v_next {ev*1000:6.1f} mm/s")

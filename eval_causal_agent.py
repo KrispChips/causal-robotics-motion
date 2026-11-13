@@ -18,23 +18,14 @@ import time
 import numpy as np
 import matplotlib.pyplot as plt
 
-from realistic_causal_env import RealisticCausalPushEnv
+from realistic_causal_env import RealisticCausalPushEnv, PRESETS
 from bayesian_causal_agent import CausalDiscoveryPolicy
-from mbrl_baseline import ModelBasedPolicy, MODEL_PATH as MBRL_PATH
-
-PPO_PATH = "models_realistic/best_model.zip"
-
-DISTRIBUTIONS = {
-    'train': 'Train',
-    'test_interp': 'Interp',
-    'test_extrap_high': 'High μ',
-    'test_extrap_low': 'Low μ',
-    'test_adversarial': 'Adv',
-}
+from mbrl_baseline import ModelBasedPolicy
+from experiment_config import parse_preset, paths, labels, figure
 
 
 class PPOPolicy:
-    def __init__(self, path=PPO_PATH):
+    def __init__(self, path):
         from stable_baselines3 import PPO
         self.model = PPO.load(path, device="cpu")
 
@@ -45,21 +36,28 @@ class PPOPolicy:
         return self.model.predict(obs, deterministic=True)
 
 
-def build_agents():
-    """name -> zero-arg factory. Baselines are skipped if not trained."""
+def build_agents(preset='narrow'):
+    """name -> zero-arg factory. Baselines are skipped if not trained.
+
+    The only preset-specific information any agent gets is the actuator
+    range (PPO gets it through its action space, the planners as
+    force_range) -- never the train/test confounder ranges."""
+    p = paths(preset)
+    force_range = (0.0, PRESETS[preset]['force_max'])
     agents = {}
-    if os.path.exists(PPO_PATH):
-        agents['PPO'] = lambda: PPOPolicy()
+    if os.path.exists(p['ppo']):
+        agents['PPO'] = lambda: PPOPolicy(p['ppo'])
     else:
-        print(f"  (skipping PPO: {PPO_PATH} not found -- run train.py)")
-    if os.path.exists(MBRL_PATH):
-        agents['Model-based RL'] = lambda: ModelBasedPolicy()
+        print(f"  (skipping PPO: {p['ppo']} not found -- run train.py --preset {preset})")
+    if os.path.exists(p['mbrl']):
+        agents['Model-based RL'] = lambda: ModelBasedPolicy(p['mbrl'], force_range=force_range)
     else:
-        print(f"  (skipping model-based RL: {MBRL_PATH} not found -- run mbrl_baseline.py)")
+        print(f"  (skipping model-based RL: {p['mbrl']} not found -- "
+              f"run mbrl_baseline.py --preset {preset})")
     agents['Causal (passive)'] = lambda: CausalDiscoveryPolicy(
-        exploration='none', rng=np.random.default_rng(0))
+        exploration='none', rng=np.random.default_rng(0), force_range=force_range)
     agents['Causal (active IG)'] = lambda: CausalDiscoveryPolicy(
-        exploration='active', rng=np.random.default_rng(0))
+        exploration='active', rng=np.random.default_rng(0), force_range=force_range)
     return agents
 
 
@@ -73,8 +71,9 @@ def wilson_interval(k, n, z=1.96):
     return centre - half, centre + half
 
 
-def evaluate(policy, env_mode, n_episodes=50, seed_offset=1000):
-    env = RealisticCausalPushEnv(render_mode=None, distribution_mode=env_mode)
+def evaluate(policy, env_mode, n_episodes=50, seed_offset=1000, preset='narrow'):
+    env = RealisticCausalPushEnv(render_mode=None, distribution_mode=env_mode,
+                                 preset=preset)
     is_causal = isinstance(policy, CausalDiscoveryPolicy)
     r = {k: [] for k in ('success', 'final_distance', 'true_friction', 'true_mass',
                          'friction_est', 'mass_est', 'friction_std', 'mass_std',
@@ -113,18 +112,20 @@ def evaluate(policy, env_mode, n_episodes=50, seed_offset=1000):
     return out
 
 
-def run_comparison(n_episodes=50):
+def run_comparison(n_episodes=50, preset='narrow'):
     print("=" * 78)
-    print(f"AGENT COMPARISON ({n_episodes} paired episodes per distribution)")
+    print(f"AGENT COMPARISON ({n_episodes} paired episodes per distribution, "
+          f"preset '{preset}')")
     print("=" * 78)
-    agents = build_agents()
+    distributions = labels(preset)
+    agents = build_agents(preset)
     results = {}
     for name, factory in agents.items():
         print(f"\n--- {name} ---")
         policy = factory()
         results[name] = {}
-        for mode, label in DISTRIBUTIONS.items():
-            r = evaluate(policy, mode, n_episodes)
+        for mode, label in distributions.items():
+            r = evaluate(policy, mode, n_episodes, preset=preset)
             results[name][mode] = r
             lo, hi = r['success_ci']
             line = (f"  {label:7s} success {r['success_rate']*100:5.1f}% "
@@ -135,26 +136,28 @@ def run_comparison(n_episodes=50):
                          f"{r['mass_mae']:.2f}kg  probes {r['n_probes'].mean():.1f}")
             print(line + f"  ({r['sec_per_episode']*1000:.0f} ms/ep)")
 
-    print_summary_table(results)
-    plot_comparison(results)
+    print_summary_table(results, distributions)
+    plot_comparison(results, distributions,
+                    PRESETS[preset]['success_threshold'] * 100,
+                    figure('causal_vs_baseline_comparison.png', preset))
     return results
 
 
-def print_summary_table(results):
+def print_summary_table(results, distributions):
     names = list(results)
     print("\n" + "=" * 78)
     print("SUCCESS RATE (%)")
     print("=" * 78)
     print(f"{'':10s}" + "".join(f"{n:>18s}" for n in names))
-    for mode, label in DISTRIBUTIONS.items():
+    for mode, label in distributions.items():
         print(f"{label:10s}" + "".join(
             f"{results[n][mode]['success_rate']*100:18.1f}" for n in names))
 
 
-def plot_comparison(results, path='causal_vs_baseline_comparison.png'):
+def plot_comparison(results, distributions, threshold_cm, path):
     names = list(results)
-    modes = list(DISTRIBUTIONS)
-    labels = [DISTRIBUTIONS[m] for m in modes]
+    modes = list(distributions)
+    labels = [distributions[m] for m in modes]
     x = np.arange(len(modes))
     width = 0.8 / len(names)
     colors = {'PPO': '#d95f02', 'Model-based RL': '#7570b3',
@@ -181,7 +184,8 @@ def plot_comparison(results, path='causal_vs_baseline_comparison.png'):
         d = [results[n][m]['mean_final_distance'] * 100 for m in modes]
         ax.bar(x + (i - (len(names) - 1) / 2) * width, d, width, label=n,
                color=colors.get(n))
-    ax.axhline(1.0, color='gray', ls='--', lw=1, label='±1cm success zone')
+    ax.axhline(threshold_cm, color='gray', ls='--', lw=1,
+               label=f'±{threshold_cm:.0f}cm success zone')
     ax.set_yscale('log'); ax.set_ylabel('Mean final distance to target (cm)')
     ax.set_title('Final placement error')
     ax.set_xticks(x); ax.set_xticklabels(labels); ax.legend(fontsize=8)
@@ -211,7 +215,8 @@ def plot_comparison(results, path='causal_vs_baseline_comparison.png'):
         ef = np.concatenate([results[n][m]['friction_est'] for m in modes])
         ax.scatter(tf, ef, s=18, alpha=0.5, marker=markers[i % 2], label=n,
                    color=colors.get(n))
-    lims = [0.1, 0.4]
+    all_f = np.concatenate([results[n][m]['true_friction'] for n in causal for m in modes])
+    lims = [max(0.0, all_f.min() - 0.05), all_f.max() + 0.05]
     ax.plot(lims, lims, 'k--', lw=1, label='perfect inference')
     ax.set_xlabel('True friction μ'); ax.set_ylabel('Inferred μ (posterior mean)')
     ax.set_title('Inferred vs true friction (all distributions)')
@@ -224,4 +229,6 @@ def plot_comparison(results, path='causal_vs_baseline_comparison.png'):
 
 
 if __name__ == "__main__":
-    run_comparison()
+    args = parse_preset("Compare all agents",
+                        extra_args=[(('--episodes',), dict(type=int, default=50))])
+    run_comparison(args.episodes, args.preset)

@@ -84,17 +84,23 @@ class BayesianCausalAgent:
     """Grid-based Bayesian posterior over (friction, mass) + planner."""
 
     def __init__(self,
-                 friction_range=(0.05, 0.80),
-                 mass_range=(0.3, 2.5),
-                 grid_size=(120, 120),
+                 friction_range=(0.02, 1.20),
+                 mass_range=(0.1, 4.0),
+                 grid_size=(160, 160),
                  velocity_noise_std=0.015,
                  n_plan_samples=256,
-                 n_candidate_forces=81,
+                 force_range=(FORCE_MIN, FORCE_MAX),
+                 force_resolution=0.1,
                  rng=None):
         """
-        Prior: uniform over a box that covers every train/test setting with
-        margin (the PDF's full physical range is mu in [0.2,0.8], m in
-        [0.5,2.0]). The agent is NOT told the training distribution.
+        Prior: uniform over a deliberately generous physical box (mu up to
+        1.2 covers rubber-on-concrete; mass 0.1-4kg covers anything a 10cm
+        cube plausibly weighs). It is the same for every preset and is NOT
+        fitted to the training or test distributions -- the agent must find
+        the confounders from interaction alone.
+
+        force_range: the actuator limits (the same action-space information
+        PPO gets); candidate forces are spaced force_resolution N apart.
 
         velocity_noise_std: per-step observation noise on velocity (m/s).
         Covers model error (~0.003) plus the env's per-step friction
@@ -109,7 +115,10 @@ class BayesianCausalAgent:
         self.m_flat = m_grid.ravel()
         self.velocity_noise_std = velocity_noise_std
         self.n_plan_samples = n_plan_samples
-        self.candidate_forces = np.linspace(FORCE_MIN, FORCE_MAX, n_candidate_forces)
+        f_lo, f_hi = force_range
+        self.force_range = (f_lo, f_hi)
+        self.candidate_forces = np.linspace(
+            f_lo, f_hi, int(round((f_hi - f_lo) / force_resolution)) + 1)
         self.reset_beliefs()
 
     # ------------------------------------------------------------------ beliefs
@@ -344,4 +353,5 @@ class CausalDiscoveryPolicy:
 
         self.last_x, self.last_v = x, v
         self.episode_step += 1
-        return np.array([force_to_action(force)], dtype=np.float32), None
+        return np.array([force_to_action(force, *self.agent.force_range)],
+                        dtype=np.float32), None
