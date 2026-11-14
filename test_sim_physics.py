@@ -368,6 +368,40 @@ def test_target_reachable_and_distributions_separated():
 # --------------------------------------------------------------------------
 # Panda stacking (stack_env.py)
 # --------------------------------------------------------------------------
+def test_domain_randomized_box_covers_every_mode():
+    """train_dr (coverage baselines) spans every train and test range."""
+    from realistic_causal_env import mode_spec, TRAIN_DR
+    for preset, spec in PRESETS.items():
+        box = mode_spec(preset, TRAIN_DR)
+        for mode in spec['modes'].values():
+            for k in ('mass', 'friction', 'roughness'):
+                assert box[k][0] <= mode[k][0] and mode[k][1] <= box[k][1], (preset, k)
+        env = RealisticCausalPushEnv(distribution_mode=TRAIN_DR, preset=preset)
+        for s in range(30):
+            env.reset(seed=s)
+            assert box['friction'][0] <= env.base_friction <= box['friction'][1]
+            assert box['mass'][0] <= env.mass <= box['mass'][1]
+        env.close()
+
+
+def test_ppo_history_reconstruction_matches_env():
+    """Eval rebuilds a PPO variant's own history from the shared 3-step env."""
+    from eval_causal_agent import PPOPolicy
+    for H in (3, 20):
+        a = RealisticCausalPushEnv(preset='pdf', history_length=3)
+        b = RealisticCausalPushEnv(preset='pdf', history_length=H)
+        pol = PPOPolicy.__new__(PPOPolicy)
+        pol.H = H
+        rng = np.random.default_rng(0)
+        for ep in range(2):
+            oa, _ = a.reset(seed=ep); ob, _ = b.reset(seed=ep); pol.reset()
+            for _ in range(20):
+                assert np.array_equal(pol.own_obs(oa), ob), H
+                act = rng.uniform(-1, 1, 1).astype(np.float32)
+                oa, *_ = a.step(act); ob, *_ = b.step(act)
+        a.close(); b.close()
+
+
 def _stack(mu, mass, a_peak):
     import stack_env as S
     env = S.PandaStackEnv(preset='pdf', distribution_mode='test_interp')

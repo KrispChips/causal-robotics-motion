@@ -59,6 +59,23 @@ PRESETS = {
 }
 
 
+# Domain-randomized training distribution for the coverage baselines: the
+# bounding box of every train AND test range of a preset. Training on it
+# gives a learner privileged coverage of the test conditions, so it is an
+# upper bound on what more data alone can do -- not a fair default.
+TRAIN_DR = 'train_dr'
+
+
+def mode_spec(preset, mode):
+    """(lo, hi) ranges of mass/friction/roughness for a mode of a preset."""
+    modes = PRESETS[preset]['modes']
+    if mode == TRAIN_DR:
+        return {k: (min(s[k][0] for s in modes.values()),
+                    max(s[k][1] for s in modes.values()))
+                for k in ('mass', 'friction', 'roughness')}
+    return modes[mode]
+
+
 class RealisticCausalPushEnv(gym.Env):
     """
     Realistic Causal Robotics Environment
@@ -85,7 +102,7 @@ class RealisticCausalPushEnv(gym.Env):
         assert preset in PRESETS, f"preset must be one of {list(PRESETS)}"
         self.preset = preset
         self._preset = PRESETS[preset]
-        assert distribution_mode in self._preset['modes'],             f"{preset} preset modes: {list(self._preset['modes'])}"
+        assert distribution_mode in self._preset['modes'] or distribution_mode == TRAIN_DR,             f"{preset} preset modes: {list(self._preset['modes'])}"
         self.render_mode = render_mode
         self.distribution_mode = distribution_mode
         self.history_length = history_length
@@ -148,7 +165,7 @@ class RealisticCausalPushEnv(gym.Env):
 
     def set_distribution_mode(self, mode):
         """Switch between this preset's train/test distributions"""
-        valid_modes = list(self._preset['modes'])
+        valid_modes = list(self._preset['modes']) + [TRAIN_DR]
         assert mode in valid_modes, f"Mode must be one of {valid_modes}"
         self.distribution_mode = mode
 
@@ -167,7 +184,7 @@ class RealisticCausalPushEnv(gym.Env):
             base_friction: Mean friction coefficient
             roughness: Surface roughness (0=smooth, 1=rough)
         """
-        spec = self._preset['modes'][self.distribution_mode]
+        spec = mode_spec(self.preset, self.distribution_mode)
         values = []
         for key in ('mass', 'friction', 'roughness'):
             lo, hi = spec[key]

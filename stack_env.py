@@ -39,7 +39,7 @@ import pybullet as p
 import pybullet_data
 from gymnasium import spaces
 
-from realistic_causal_env import RealisticCausalPushEnv, PRESETS
+from realistic_causal_env import RealisticCausalPushEnv, PRESETS, TRAIN_DR, mode_spec
 
 G = 9.8
 DT = 1.0 / 240.0
@@ -207,7 +207,7 @@ class PandaStackEnv(gym.Env):
         (N,PUSH_STEPS,3) of pre-recorded push phases to sample from
         (speeds up RL training; identical content to recording on the fly)."""
         super().__init__()
-        assert distribution_mode in PRESETS[preset]['modes']
+        assert distribution_mode in PRESETS[preset]['modes'] or distribution_mode == TRAIN_DR
         self.preset = preset
         self.distribution_mode = distribution_mode
         self.force_max = PRESETS[preset]['force_max']
@@ -221,7 +221,7 @@ class PandaStackEnv(gym.Env):
 
     # -------------------------------------------------------------- helpers
     def _sample_confounders(self):
-        spec = PRESETS[self.preset]['modes'][self.distribution_mode]
+        spec = mode_spec(self.preset, self.distribution_mode)
         vals = []
         for key in ('mass', 'friction', 'roughness'):
             lo, hi = spec[key]

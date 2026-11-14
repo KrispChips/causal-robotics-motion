@@ -8,15 +8,15 @@ from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback,
 from stable_baselines3.common.monitor import Monitor
 
 from realistic_causal_env import RealisticCausalPushEnv
-from experiment_config import parse_preset, paths
+from experiment_config import parse_preset, paths, PPO_VARIANTS, ppo_dir
 
-def make_env(rank, mode='train', preset='narrow'):
+def make_env(rank, mode='train', preset='narrow', history=3):
     """Create environment factory"""
     def _init():
         env = RealisticCausalPushEnv(
             render_mode=None,
             distribution_mode=mode,
-            history_length=3,
+            history_length=history,
             preset=preset,
         )
         return Monitor(env)
@@ -59,13 +59,18 @@ class DetailedLoggingCallback(BaseCallback):
         
         return True
 
-def train_baseline(preset='narrow'):
+def train_baseline(preset='narrow', variant='ppo', timesteps=500000):
     """
-    IMPROVED: Train baseline RL agent with better monitoring
+    Train a PPO baseline. variant picks history length and training
+    distribution (experiment_config.PPO_VARIANTS).
     """
-
-    log_dir = paths(preset)['logs'] + "/"
-    models_dir = paths(preset)['models'] + "/"
+    import torch
+    torch.set_num_threads(1)   # several variants train side by side
+    spec = PPO_VARIANTS[variant]
+    dist, history = spec['dist'], spec['history']
+    sub = '' if variant == 'ppo' else variant + '/'
+    log_dir = paths(preset)['logs'] + "/" + sub
+    models_dir = ppo_dir(preset, variant) + "/"
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(models_dir, exist_ok=True)
     
@@ -74,17 +79,18 @@ def train_baseline(preset='narrow'):
     print("="*70)
     print("Environment: Realistic Causal Push (FIXED)")
     probe = RealisticCausalPushEnv(preset=preset)
-    print(f"Preset: {preset}")
+    print(f"Preset: {preset}   variant: {variant} ({spec['label']}: "
+          f"history {history}, distribution '{dist}')")
     print(f"Success threshold: ±{probe.success_threshold*100:.1f}cm")
     print(f"Force range: [{probe.force_min}, {probe.force_max}]N")
     probe.close()
     print("="*70)
     
     # Create training environment
-    env = DummyVecEnv([make_env(0, mode='train', preset=preset)])
+    env = DummyVecEnv([make_env(0, mode=dist, preset=preset, history=history)])
 
-    # Create evaluation environment
-    eval_env = DummyVecEnv([make_env(0, mode='train', preset=preset)])
+    # Model selection on the agent's own training distribution
+    eval_env = DummyVecEnv([make_env(0, mode=dist, preset=preset, history=history)])
     
     # Callbacks
     eval_callback = EvalCallback(
@@ -123,12 +129,12 @@ def train_baseline(preset='narrow'):
         vf_coef=0.5,
         max_grad_norm=0.5,
         tensorboard_log=log_dir,
-        device="cpu"
+        device="cpu",
+        seed=0,
     )
     
     print("\nStarting training...")
-    print("Total timesteps: 500,000")  # INCREASED from 300K
-    print("Expected time: ~45-60 minutes on CPU")
+    print(f"Total timesteps: {timesteps:,}")
     print("\nMonitoring:")
     print("  - Episode rewards and success rate will be logged")
     print("  - Best model saved based on mean reward")
@@ -137,7 +143,7 @@ def train_baseline(preset='narrow'):
     
     try:
         model.learn(
-            total_timesteps=500000,  # INCREASED from 300K
+            total_timesteps=timesteps,
             callback=[eval_callback, checkpoint_callback, detailed_callback],
             progress_bar=True
         )
@@ -156,8 +162,8 @@ def train_baseline(preset='narrow'):
         print("FINAL MODEL EVALUATION (Training Distribution)")
         print("="*70)
         
-        test_env = RealisticCausalPushEnv(render_mode=None, distribution_mode='train',
-                                          preset=preset)
+        test_env = RealisticCausalPushEnv(render_mode=None, distribution_mode=dist,
+                                          preset=preset, history_length=history)
         successes = []
         distances = []
 
@@ -204,4 +210,7 @@ def train_baseline(preset='narrow'):
         eval_env.close()
 
 if __name__ == "__main__":
-    train_baseline(parse_preset("Train the PPO baseline").preset)
+    args = parse_preset("Train a PPO baseline", extra_args=[
+        (('--variant',), dict(default='ppo', choices=list(PPO_VARIANTS))),
+        (('--timesteps',), dict(type=int, default=500000))])
+    train_baseline(args.preset, args.variant, args.timesteps)

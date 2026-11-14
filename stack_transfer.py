@@ -8,6 +8,8 @@ agent receives the identical push log as its only information.
 Agents
   PPO (stack)      - model-free RL, trained on stacking episodes from the
                      training distribution only (raw push log -> carry speed)
+  PPO (stack, DR)  - the same, trained on the domain-randomized box covering
+                     every train and test range (privileged coverage)
   Causal           - push log -> Bayesian posterior over (mu, m) (the same
                      inference as the push agent) -> friction-cone grasp
                      condition (textbook: no slip allowed) over the robot's
@@ -27,6 +29,7 @@ everything else.
 Usage
   python stack_transfer.py bank  --preset pdf   # record push logs (train + eval)
   python stack_transfer.py train --preset pdf   # train PPO stacking baseline
+  python stack_transfer.py train --preset pdf --dr   # domain-randomized PPO
   python stack_transfer.py eval  --preset pdf   # paired comparison + figure
 """
 
@@ -38,7 +41,7 @@ from multiprocessing import Pool
 import numpy as np
 
 from experiment_config import parse_preset, paths, labels, figure, load_agent_config
-from realistic_causal_env import PRESETS
+from realistic_causal_env import PRESETS, TRAIN_DR, mode_spec
 import stack_env as S
 
 N_TRAIN_BANK = 2000
@@ -49,7 +52,7 @@ PPO_STEPS = 20000                   # = stacking episodes (one decision each)
 
 # ------------------------------------------------------------- push logs
 def _sample(preset, mode, rng):
-    spec = PRESETS[preset]['modes'][mode]
+    spec = mode_spec(preset, mode)
     out = []
     for key in ('mass', 'friction', 'roughness'):
         lo, hi = spec[key]
@@ -145,24 +148,28 @@ class FixedSpeedPolicy:
 
 
 class PPOStackPolicy:
-    name = 'PPO (stack)'
-
-    def __init__(self, path):
+    def __init__(self, path, name='PPO (stack)'):
         from stable_baselines3 import PPO
         self.model = PPO.load(path, device='cpu')
+        self.name = name
 
     def predict(self, obs, deterministic=True):
         return self.model.predict(obs, deterministic=True)
 
 
 # ------------------------------------------------------------- PPO train
-def train_ppo(preset, timesteps=PPO_STEPS):
+def ppo_stack_path(preset, dr=False):
+    return os.path.join(paths(preset)['models'], 'ppo_stack_dr.zip' if dr else 'ppo_stack.zip')
+
+
+def train_ppo(preset, timesteps=PPO_STEPS, dr=False):
     from stable_baselines3 import PPO
     from stable_baselines3.common.monitor import Monitor
-    bank = load_bank(preset, 'train', 'train')
-    log_dir = os.path.join(paths(preset)['logs'], 'stack')
+    dist = TRAIN_DR if dr else 'train'
+    bank = load_bank(preset, dist, 'train')
+    log_dir = os.path.join(paths(preset)['logs'], 'stack_dr' if dr else 'stack')
     os.makedirs(log_dir, exist_ok=True)
-    env = Monitor(S.PandaStackEnv(preset=preset, distribution_mode='train', push_bank=bank),
+    env = Monitor(S.PandaStackEnv(preset=preset, distribution_mode=dist, push_bank=bank),
                   os.path.join(log_dir, 'monitor'), info_keywords=('is_success', 'slipped'))
     env.reset(seed=0)
     model = PPO('MlpPolicy', env, n_steps=512, batch_size=64, n_epochs=10,
@@ -170,7 +177,7 @@ def train_ppo(preset, timesteps=PPO_STEPS):
                 ent_coef=0.0, seed=0, verbose=1, device='cpu')
     t0 = time.time()
     model.learn(total_timesteps=timesteps, progress_bar=False)
-    out = os.path.join(paths(preset)['models'], 'ppo_stack.zip')
+    out = ppo_stack_path(preset, dr)
     model.save(out)
     print(f"Saved {out} ({time.time()-t0:.0f}s, {timesteps} stacking episodes)")
 
@@ -189,11 +196,13 @@ def wilson(k, n, z=1.96):
 def evaluate(preset):
     force_max = PRESETS[preset]['force_max']
     agents = []
-    ppo_path = os.path.join(paths(preset)['models'], 'ppo_stack.zip')
-    if os.path.exists(ppo_path):
-        agents.append(PPOStackPolicy(ppo_path))
-    else:
-        print(f"  (skipping PPO: {ppo_path} missing -- run: stack_transfer.py train)")
+    for dr, name in ((False, 'PPO (stack)'), (True, 'PPO (stack, DR)')):
+        path = ppo_stack_path(preset, dr)
+        if os.path.exists(path):
+            agents.append(PPOStackPolicy(path, name))
+        else:
+            print(f"  (skipping {name}: {path} missing -- run: stack_transfer.py train"
+                  f"{' --dr' if dr else ''})")
     sigma = load_agent_config(preset)['velocity_noise_std']   # tuned on train only
     agents += [CausalStackPolicy(force_max, sigma), FixedSpeedPolicy(), OracleStackPolicy()]
 
@@ -246,7 +255,7 @@ def plot(results, preset):
     modes = list(results)
     names = list(results[modes[0]])
     lab = labels(preset)
-    colors = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100']  # fixed categorical order
+    colors = ['#2a78d6', '#7b5ea7', '#eb6834', '#1baf7a', '#eda100']  # fixed categorical order
     fig, axes = plt.subplots(1, 3, figsize=(18, 5.2))
     x = np.arange(len(modes))
     w = 0.8 / len(names)
@@ -274,7 +283,7 @@ def plot(results, preset):
     ax = axes[2]
     ref = results[fr][names[0]]
     ax.scatter(ref['mu'], ref['m'], s=10, color='#c3c2b7', label='episode')
-    markers = ['x', 'o', '+', 's']
+    markers = ['x', 'D', 'o', '+', 's']
     for i, n in enumerate(names):
         d = results[fr][n]['dropped'] | ~results[fr][n]['success']
         if d.any():
@@ -296,14 +305,18 @@ def plot(results, preset):
 # ------------------------------------------------------------------ main
 if __name__ == '__main__':
     args = parse_preset('Push -> stack transfer experiment',
-                        extra_args=[(('command',), dict(choices=['bank', 'train', 'eval']))])
+                        extra_args=[(('command',), dict(choices=['bank', 'train', 'eval'])),
+                                    (('--dr',), dict(action='store_true',
+                                                     help='domain-randomized training'))])
     preset = args.preset
-    if args.command == 'bank':
+    if args.command == 'bank' and args.dr:
+        record_bank(preset, TRAIN_DR, N_TRAIN_BANK, seed0=5_000_000, split='train')
+    elif args.command == 'bank':
         record_bank(preset, 'train', N_TRAIN_BANK, seed0=0, split='train')
         for i, mode in enumerate(labels(preset)):
             record_bank(preset, mode, N_EVAL.get(mode, N_EVAL_DEFAULT),
                         seed0=10_000_000 * (i + 1), split='eval')
     elif args.command == 'train':
-        train_ppo(preset)
+        train_ppo(preset, dr=args.dr)
     else:
         evaluate(preset)

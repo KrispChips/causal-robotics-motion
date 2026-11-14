@@ -2,8 +2,11 @@
 Compare all agents across the train / test distributions.
 
 Agents
-  PPO                - Baseline 1: model-free RL (models_realistic/best_model.zip)
+  PPO                - Baseline 1: model-free RL, 3-step history (plan of record)
+  PPO variants       - full-episode history and/or domain randomization over
+                       every train+test range (experiment_config.PPO_VARIANTS)
   Model-based RL     - Baseline 2: learned average dynamics + shared planner
+  Model-based RL (history) - dynamics conditioned on the episode so far
   Causal (passive)   - Bayesian confounder inference, exploit only
   Causal (active IG) - + safe information-gain probing first (Stage 3)
 
@@ -22,19 +25,36 @@ import matplotlib.pyplot as plt
 from realistic_causal_env import RealisticCausalPushEnv, PRESETS
 from bayesian_causal_agent import CausalDiscoveryPolicy
 from experiment_config import (parse_preset, paths, labels, figure, load_agent_config,
-                               make_causal_policy, make_mbrl_policy)
+                               make_causal_policy, make_mbrl_policy, make_mbrl_ctx_policy,
+                               PPO_VARIANTS, ppo_path)
 
 
 class PPOPolicy:
-    def __init__(self, path):
+    """Rebuilds the observation the policy was trained with (its own history
+    length) from the shared evaluation env's stream: obs[:5] is the current
+    state and obs[-1] the force applied on the previous step."""
+
+    def __init__(self, path, history_length=3):
         from stable_baselines3 import PPO
         self.model = PPO.load(path, device="cpu")
+        self.H = history_length
+        self.reset()
 
     def reset(self):
-        pass
+        self.states, self.forces = None, None
+
+    def own_obs(self, obs):
+        base = np.asarray(obs[:5], dtype=np.float32)
+        if self.states is None:                       # first step of the episode
+            self.states, self.forces = [base] * self.H, [0.0] * self.H
+        else:
+            self.states = self.states[1:] + [base]
+            self.forces = self.forces[1:] + [float(obs[-1])]
+        return np.concatenate([base, *self.states,
+                               np.array(self.forces, dtype=np.float32)])
 
     def predict(self, obs, deterministic=True):
-        return self.model.predict(obs, deterministic=True)
+        return self.model.predict(self.own_obs(obs), deterministic=True)
 
 
 def build_agents(preset='narrow'):
@@ -46,15 +66,24 @@ def build_agents(preset='narrow'):
     p = paths(preset)
     cfg = load_agent_config(preset)   # hyperparameters tuned on train only
     agents = {}
-    if os.path.exists(p['ppo']):
-        agents['PPO'] = lambda: PPOPolicy(p['ppo'])
-    else:
-        print(f"  (skipping PPO: {p['ppo']} not found -- run train.py --preset {preset})")
+    for variant, spec in PPO_VARIANTS.items():
+        path = ppo_path(preset, variant)
+        if os.path.exists(path):
+            agents[spec['label']] = (lambda path=path, h=spec['history']:
+                                     PPOPolicy(path, h))
+        else:
+            print(f"  (skipping {spec['label']}: {path} not found -- "
+                  f"run train.py --preset {preset} --variant {variant})")
     if os.path.exists(p['mbrl']):
         agents['Model-based RL'] = lambda: make_mbrl_policy(preset, cfg)
     else:
         print(f"  (skipping model-based RL: {p['mbrl']} not found -- "
               f"run mbrl_baseline.py --preset {preset})")
+    if os.path.exists(p['mbrl_ctx']) and 'mbrl_ctx_plan' in cfg:
+        agents['Model-based RL (history)'] = lambda: make_mbrl_ctx_policy(preset, cfg)
+    else:
+        print(f"  (skipping model-based RL (history): run mbrl_context_baseline.py and "
+              f"tune_on_train.py --only mbrl_ctx for preset {preset})")
     agents['Causal (passive)'] = lambda: make_causal_policy(preset, 'none', config=cfg)
     agents['Causal (active IG)'] = lambda: make_causal_policy(preset, 'active', config=cfg)
     return agents
@@ -157,10 +186,10 @@ def print_summary_table(results, distributions):
     print("\n" + "=" * 78)
     print("SUCCESS RATE (%)")
     print("=" * 78)
-    print(f"{'':10s}" + "".join(f"{n:>18s}" for n in names))
-    for mode, label in distributions.items():
-        print(f"{label:10s}" + "".join(
-            f"{results[n][mode]['success_rate']*100:18.1f}" for n in names))
+    print(f"{'':26s}" + "".join(f"{l:>11s}" for l in distributions.values()))
+    for n in names:
+        print(f"{n:26s}" + "".join(
+            f"{results[n][mode]['success_rate']*100:11.1f}" for mode in distributions))
 
 
 def plot_comparison(results, distributions, threshold_cm, path):
@@ -169,10 +198,12 @@ def plot_comparison(results, distributions, threshold_cm, path):
     labels = [distributions[m] for m in modes]
     x = np.arange(len(modes))
     width = 0.8 / len(names)
-    colors = {'PPO': '#d95f02', 'Model-based RL': '#7570b3',
+    colors = {'PPO': '#d95f02', 'PPO (full history)': '#e6550d',
+              'PPO (DR)': '#fd8d3c', 'PPO (DR, full hist)': '#a63603',
+              'Model-based RL': '#7570b3', 'Model-based RL (history)': '#54278f',
               'Causal (passive)': '#1b9e77', 'Causal (active IG)': '#66a61e'}
 
-    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    fig, axes = plt.subplots(2, 2, figsize=(18, 10))
 
     # (a) success rate with 95% CI
     ax = axes[0, 0]

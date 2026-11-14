@@ -46,8 +46,32 @@ def paths(preset):
         d = {'models': f'models_{preset}', 'logs': f'logs_{preset}', 'suffix': f'_{preset}'}
     d['ppo'] = os.path.join(d['models'], 'best_model.zip')
     d['mbrl'] = os.path.join(d['models'], 'mbrl_ensemble.npz')
+    d['mbrl_ctx'] = os.path.join(d['models'], 'mbrl_context_ensemble.npz')
     d['evaluations'] = os.path.join(d['logs'], 'evaluations.npz')
     return d
+
+
+# PPO variants. 'ppo' is the original baseline (plan of record); the others
+# test whether its failures come from too little memory (full-episode
+# history, the same information the causal agent conditions on) or too
+# little training coverage (domain randomization over every train and test
+# range -- privileged information, so an upper bound for data coverage).
+PPO_VARIANTS = {
+    'ppo':         dict(label='PPO',                 history=3,  dist='train'),
+    'ppo_hist':    dict(label='PPO (full history)',  history=20, dist='train'),
+    'ppo_dr':      dict(label='PPO (DR)',            history=3,  dist='train_dr'),
+    'ppo_dr_hist': dict(label='PPO (DR, full hist)', history=20, dist='train_dr'),
+}
+
+
+def ppo_dir(preset, variant):
+    """Original PPO keeps its original location; variants get a subfolder."""
+    p = paths(preset)
+    return p['models'] if variant == 'ppo' else os.path.join(p['models'], variant)
+
+
+def ppo_path(preset, variant):
+    return os.path.join(ppo_dir(preset, variant), 'best_model.zip')
 
 
 def agent_config_path(preset):
@@ -90,6 +114,17 @@ def make_mbrl_policy(preset, config=None):
     return ModelBasedPolicy(paths(preset)['mbrl'],
                             force_range=(0.0, PRESETS[preset]['force_max']),
                             plan_kwargs=cfg['mbrl_plan'])
+
+
+def make_mbrl_ctx_policy(preset, config=None):
+    from mbrl_context_baseline import ContextModelPolicy
+    cfg = config or load_agent_config(preset)
+    if 'mbrl_ctx_plan' not in cfg:
+        raise KeyError(f"no mbrl_ctx_plan in {agent_config_path(preset)}: run "
+                       f"`python tune_on_train.py --preset {preset} --only mbrl_ctx`")
+    return ContextModelPolicy(paths(preset)['mbrl_ctx'],
+                              force_range=(0.0, PRESETS[preset]['force_max']),
+                              plan_kwargs=cfg['mbrl_ctx_plan'])
 
 
 def figure(name, preset):

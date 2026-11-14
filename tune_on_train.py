@@ -76,9 +76,11 @@ def tune_noise(preset):
 # ------------------------------------------------- 2./3. episode returns
 def _episode_return(args):
     preset, kind, cfg, seed = args
-    from experiment_config import make_causal_policy, make_mbrl_policy
+    from experiment_config import make_causal_policy, make_mbrl_policy, make_mbrl_ctx_policy
     if kind == 'mbrl':
         policy = make_mbrl_policy(preset, config=cfg)
+    elif kind == 'mbrl_ctx':
+        policy = make_mbrl_ctx_policy(preset, config=cfg)
     else:
         # Planner RNG varies per episode (as in evaluation). With one fixed
         # stream every setting is scored on the same random draws, and the
@@ -119,6 +121,25 @@ def grid_search(pool, preset, kind, base_cfg, key, grid, expand):
                              for c, s in zip(combos, scores)]
 
 
+def tune_only_mbrl_ctx(preset):
+    """Add the history-conditioned MBRL planner settings to an existing
+    config (same grid, seeds and episodes as every other agent)."""
+    t0 = time.time()
+    path = agent_config_path(preset)
+    with open(path) as f:
+        cfg = json.load(f)
+    cfg['mbrl_ctx_plan'] = dict(cfg['mbrl_plan'])        # overwritten per grid point
+    print(f"Tuning history-conditioned MBRL planner on '{preset}' train only")
+    with Pool(15) as pool:
+        cfg['mbrl_ctx_plan'], log = grid_search(pool, preset, 'mbrl_ctx', cfg,
+                                                'mbrl_ctx_plan', PLAN_GRID, lambda d: d)
+    with open(path, 'w') as f:
+        json.dump(cfg, f, indent=2)
+    with open(path.replace('.json', '_search_log_mbrl_ctx.json'), 'w') as f:
+        json.dump(log, f, indent=1)
+    print(f"Saved {path} ({time.time()-t0:.0f}s): mbrl_ctx_plan = {cfg['mbrl_ctx_plan']}")
+
+
 def main(preset):
     t0 = time.time()
     print(f"Tuning on the TRAINING distribution of preset '{preset}' only")
@@ -142,6 +163,11 @@ def main(preset):
                 pool, preset, 'mbrl', cfg, 'mbrl_plan', PLAN_GRID, lambda d: d)
         else:
             print(f"\n2b. (skipped: {paths(preset)['mbrl']} missing)")
+        if os.path.exists(paths(preset)['mbrl_ctx']):
+            print("\n2c. History-conditioned model-based baseline planner")
+            cfg['mbrl_ctx_plan'] = dict(cfg['mbrl_plan'])
+            cfg['mbrl_ctx_plan'], log['mbrl_ctx_plan'] = grid_search(
+                pool, preset, 'mbrl_ctx', cfg, 'mbrl_ctx_plan', PLAN_GRID, lambda d: d)
         print("\n3. Active exploration settings")
         cfg['causal_explore'], log['causal_explore'] = grid_search(
             pool, preset, 'active', cfg, 'causal_explore', EXPLORE_GRID,
@@ -162,4 +188,9 @@ def main(preset):
 
 
 if __name__ == '__main__':
-    main(parse_preset('Tune planning agents on the training distribution only').preset)
+    args = parse_preset('Tune planning agents on the training distribution only',
+                        extra_args=[(('--only',), dict(choices=['mbrl_ctx'], default=None))])
+    if args.only == 'mbrl_ctx':
+        tune_only_mbrl_ctx(args.preset)
+    else:
+        main(args.preset)
