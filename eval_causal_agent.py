@@ -99,9 +99,10 @@ def wilson_interval(k, n, z=1.96):
     return centre - half, centre + half
 
 
-def evaluate(policy, env_mode, n_episodes=50, seed_offset=1000, preset='narrow'):
+def evaluate(policy, env_mode, n_episodes=50, seed_offset=1000, preset='narrow',
+             world='nominal'):
     env = RealisticCausalPushEnv(render_mode=None, distribution_mode=env_mode,
-                                 preset=preset)
+                                 preset=preset, world=world)
     is_causal = isinstance(policy, CausalDiscoveryPolicy)
     r = {k: [] for k in ('success', 'final_distance', 'true_friction', 'true_mass',
                          'friction_est', 'mass_est', 'friction_std', 'mass_std',

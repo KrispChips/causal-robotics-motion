@@ -66,6 +66,23 @@ PRESETS = {
 TRAIN_DR = 'train_dr'
 
 
+# "Worlds" with real-world effects that the causal agent's textbook Coulomb
+# model does not include (for the model-misspecification ablation). 'nominal'
+# is the original simulator; every existing result uses it.
+WORLDS = {
+    'nominal': {},
+    # static friction 30% above kinetic (typical for dry contacts)
+    'stiction': {'stiction_ratio': 1.3},
+    # friction rising with sliding speed: mu(v) = mu_k * (1 + 0.5 v[m/s])
+    'speed_friction': {'friction_speed_gain': 0.5},
+    # actuator delivers 85% of the command above a deadband of 5% of full scale
+    'actuator': {'force_gain': 0.85, 'force_deadband_frac': 0.05},
+    'combined': {'stiction_ratio': 1.3, 'friction_speed_gain': 0.5,
+                 'force_gain': 0.85, 'force_deadband_frac': 0.05},
+}
+STICTION_SPEED = 0.005   # m/s: below this the block counts as stuck
+
+
 def mode_spec(preset, mode):
     """(lo, hi) ranges of mass/friction/roughness for a mode of a preset."""
     modes = PRESETS[preset]['modes']
@@ -97,8 +114,11 @@ class RealisticCausalPushEnv(gym.Env):
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
 
     def __init__(self, render_mode=None, distribution_mode='train', history_length=3,
-                 preset='narrow', block_size=0.10):
+                 preset='narrow', block_size=0.10, world='nominal'):
         super().__init__()
+        assert world in WORLDS, f"world must be one of {list(WORLDS)}"
+        self.world = world
+        self._world = WORLDS[world]
         assert preset in PRESETS, f"preset must be one of {list(PRESETS)}"
         self.preset = preset
         self._preset = PRESETS[preset]
@@ -304,10 +324,17 @@ class RealisticCausalPushEnv(gym.Env):
         else:
             act = action
         
-        force_mag = self.action_to_force(act)
+        force_mag = self.action_to_force(act)   # commanded (what the agent knows)
 
         # Friction is resampled once per action (roughness = per-step noise)
         self.current_friction = self._apply_stochastic_friction()
+
+        w = self._world
+        delivered = force_mag
+        if 'force_gain' in w:
+            deadband = w['force_deadband_frac'] * self.force_max
+            delivered = w['force_gain'] * max(force_mag - deadband, 0.0)
+        modulate = 'stiction_ratio' in w or 'friction_speed_gain' in w
 
         # No artificial damping: the block slows down through Coulomb friction
         # only. (The old per-substep resetBaseVelocity(v*0.98) shrank velocity
@@ -317,10 +344,20 @@ class RealisticCausalPushEnv(gym.Env):
             # current centre of mass (not the world origin).
             block_pos, _ = p.getBasePositionAndOrientation(
                 self.block_id, physicsClientId=self.client)
+            if modulate:
+                speed = abs(p.getBaseVelocity(self.block_id,
+                                              physicsClientId=self.client)[0][0])
+                mu = self.current_friction
+                if speed < STICTION_SPEED:
+                    mu *= w.get('stiction_ratio', 1.0)
+                else:
+                    mu *= 1.0 + w.get('friction_speed_gain', 0.0) * speed
+                p.changeDynamics(self.block_id, -1, lateralFriction=mu,
+                                 physicsClientId=self.client)
             p.applyExternalForce(
                 self.block_id,
                 -1,
-                forceObj=[force_mag, 0, 0],
+                forceObj=[delivered, 0, 0],
                 posObj=block_pos,
                 flags=p.WORLD_FRAME,
                 physicsClientId=self.client

@@ -7,16 +7,17 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback, BaseCallback
 from stable_baselines3.common.monitor import Monitor
 
-from realistic_causal_env import RealisticCausalPushEnv
+from realistic_causal_env import RealisticCausalPushEnv, WORLDS
 from experiment_config import parse_preset, paths, PPO_VARIANTS, ppo_dir
 
-def make_env(rank, mode='train', preset='narrow', history=3):
+def make_env(rank, mode='train', preset='narrow', history=3, world='nominal'):
     """Create environment factory"""
     def _init():
         env = RealisticCausalPushEnv(
             render_mode=None,
             distribution_mode=mode,
             history_length=history,
+            world=world,
             preset=preset,
         )
         return Monitor(env)
@@ -59,18 +60,19 @@ class DetailedLoggingCallback(BaseCallback):
         
         return True
 
-def train_baseline(preset='narrow', variant='ppo', timesteps=500000):
+def train_baseline(preset='narrow', variant='ppo', timesteps=500000, world='nominal'):
     """
     Train a PPO baseline. variant picks history length and training
-    distribution (experiment_config.PPO_VARIANTS).
+    distribution (experiment_config.PPO_VARIANTS); world picks the simulator
+    variant (realistic_causal_env.WORLDS) it trains and is evaluated in.
     """
     import torch
     torch.set_num_threads(1)   # several variants train side by side
     spec = PPO_VARIANTS[variant]
     dist, history = spec['dist'], spec['history']
-    sub = '' if variant == 'ppo' else variant + '/'
-    log_dir = paths(preset)['logs'] + "/" + sub
-    models_dir = ppo_dir(preset, variant) + "/"
+    models_dir = ppo_dir(preset, variant, world) + "/"
+    log_dir = os.path.join(paths(preset)['logs'],
+                           os.path.relpath(models_dir, paths(preset)['models'])) + "/"
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(models_dir, exist_ok=True)
     
@@ -80,17 +82,17 @@ def train_baseline(preset='narrow', variant='ppo', timesteps=500000):
     print("Environment: Realistic Causal Push (FIXED)")
     probe = RealisticCausalPushEnv(preset=preset)
     print(f"Preset: {preset}   variant: {variant} ({spec['label']}: "
-          f"history {history}, distribution '{dist}')")
+          f"history {history}, distribution '{dist}', world '{world}')")
     print(f"Success threshold: ±{probe.success_threshold*100:.1f}cm")
     print(f"Force range: [{probe.force_min}, {probe.force_max}]N")
     probe.close()
     print("="*70)
     
     # Create training environment
-    env = DummyVecEnv([make_env(0, mode=dist, preset=preset, history=history)])
+    env = DummyVecEnv([make_env(0, mode=dist, preset=preset, history=history, world=world)])
 
     # Model selection on the agent's own training distribution
-    eval_env = DummyVecEnv([make_env(0, mode=dist, preset=preset, history=history)])
+    eval_env = DummyVecEnv([make_env(0, mode=dist, preset=preset, history=history, world=world)])
     
     # Callbacks
     eval_callback = EvalCallback(
@@ -163,7 +165,7 @@ def train_baseline(preset='narrow', variant='ppo', timesteps=500000):
         print("="*70)
         
         test_env = RealisticCausalPushEnv(render_mode=None, distribution_mode=dist,
-                                          preset=preset, history_length=history)
+                                          preset=preset, history_length=history, world=world)
         successes = []
         distances = []
 
@@ -212,5 +214,6 @@ def train_baseline(preset='narrow', variant='ppo', timesteps=500000):
 if __name__ == "__main__":
     args = parse_preset("Train a PPO baseline", extra_args=[
         (('--variant',), dict(default='ppo', choices=list(PPO_VARIANTS))),
-        (('--timesteps',), dict(type=int, default=500000))])
-    train_baseline(args.preset, args.variant, args.timesteps)
+        (('--timesteps',), dict(type=int, default=500000)),
+        (('--world',), dict(default='nominal', choices=list(WORLDS)))])
+    train_baseline(args.preset, args.variant, args.timesteps, args.world)

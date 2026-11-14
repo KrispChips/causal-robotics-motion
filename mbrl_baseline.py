@@ -31,10 +31,11 @@ MODEL_PATH = "models_realistic/mbrl_ensemble.npz"
 
 # ---------------------------------------------------------------- data
 def collect_transitions(mode='train', n_episodes=1000, p_zero=0.4, seed=0,
-                        preset='narrow'):
+                        preset='narrow', world='nominal'):
     """Random-force interaction data. Force is 0 with prob p_zero (so the
-    model sees coasting/braking), otherwise uniform over the force range."""
-    env = RealisticCausalPushEnv(distribution_mode=mode, preset=preset)
+    model sees coasting/braking), otherwise uniform over the force range.
+    F is the commanded force (all an agent knows about its actuator)."""
+    env = RealisticCausalPushEnv(distribution_mode=mode, preset=preset, world=world)
     rng = np.random.default_rng(seed)
     rows = []
     for ep in range(n_episodes):

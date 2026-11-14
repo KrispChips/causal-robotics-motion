@@ -64,14 +64,17 @@ PPO_VARIANTS = {
 }
 
 
-def ppo_dir(preset, variant):
-    """Original PPO keeps its original location; variants get a subfolder."""
+def ppo_dir(preset, variant, world='nominal'):
+    """Original PPO keeps its original location; variants get a subfolder;
+    PPO trained in a non-nominal world (misspecification ablation) lives
+    under world_<name>/."""
     p = paths(preset)
-    return p['models'] if variant == 'ppo' else os.path.join(p['models'], variant)
+    base = p['models'] if world == 'nominal' else os.path.join(p['models'], f'world_{world}')
+    return base if variant == 'ppo' else os.path.join(base, variant)
 
 
-def ppo_path(preset, variant):
-    return os.path.join(ppo_dir(preset, variant), 'best_model.zip')
+def ppo_path(preset, variant, world='nominal'):
+    return os.path.join(ppo_dir(preset, variant, world), 'best_model.zip')
 
 
 def agent_config_path(preset):

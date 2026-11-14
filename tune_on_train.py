@@ -38,7 +38,7 @@ TUNE_SEED = 2_000_000
 N_NOISE_EPISODES = 300
 N_TUNE_EPISODES = 100
 
-SIGMAS = [0.002, 0.003, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.05]
+SIGMAS = [0.002, 0.003, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.05, 0.075, 0.1, 0.15]
 PLAN_GRID = {'overshoot_weight': [1.0, 3.0, 10.0, 30.0],
              'recourse_steps': [1, 3, 5],
              'speed_weight': [0.03, 0.1, 0.3]}
@@ -48,10 +48,10 @@ EXPLORE_GRID = {'max_risk': [0.005, 0.01, 0.05],
 
 
 # ------------------------------------------------------------ 1. noise
-def tune_noise(preset):
+def tune_noise(preset, world='nominal'):
     from mbrl_baseline import collect_transitions
     data = collect_transitions('train', n_episodes=N_NOISE_EPISODES, seed=TUNE_SEED // 100000,
-                               preset=preset)
+                               preset=preset, world=world)
     steps = RealisticCausalPushEnv(preset=preset).max_episode_steps
     data = data.reshape(N_NOISE_EPISODES, steps, 4)            # v, F, dx, v_next
     grid = BayesianCausalAgent(force_range=(0.0, PRESETS[preset]['force_max']))

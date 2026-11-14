@@ -12,7 +12,8 @@ Bayesian system identification with a known model class.
 |---|---|
 | Knowing the physical structure and inferring hidden parameters gives robustness to distribution shift that a structure-free learner trained on a narrow distribution lacks | Yes, within this simulator (see results) |
 | Causal *discovery* (learning the graph or equations from data) beats RL | **Not tested.** The structure is given, not discovered. The PC-algorithm and VAE stages of the plan would test this |
-| The advantage would hold on a real robot | **Not tested.** The agent's physics model was validated against the same simulator it is scored in, so these are best-case numbers for a structured agent |
+| The advantage would hold on a real robot | **Not tested.** The agent's physics model was validated against the same simulator it is scored in. The misspecification ablation below estimates how the advantage degrades when the model is wrong |
+| The advantage survives a wrong model | **Partly.** It survives speed-dependent friction and actuator errors. It is lost to stiction, and in distribution the in-world-trained learners then win |
 
 ## What each agent gets
 
@@ -170,10 +171,94 @@ active narrow-adversarial from 100 to 96. Stacking became more conservative
 (Low-μ reward fell from 7.62 to 6.73), because the agent no longer knows how
 much slip the env tolerates.
 
+## Model misspecification (`eval_misspecification.py`)
+
+Every result above uses a causal model validated against this same simulator.
+To estimate how it would fare against reality, the simulator gains real-world
+effects that the agent's textbook Coulomb model does not include
+(`realistic_causal_env.WORLDS`):
+
+| World | Effect |
+|---|---|
+| stiction | static friction 1.3× kinetic (sticks until a larger breakaway force) |
+| speed_friction | μ(v) = μ_k·(1 + 0.5·v), i.e. +25% at 0.5 m/s |
+| actuator | delivered force = 0.85 × (command − deadband of 5% full scale) |
+| combined | all three |
+
+This mirrors sim-to-real. PPO and DR-PPO are **retrained inside each world**,
+so they learn whatever the world does. The causal agent keeps its textbook model.
+It only re-fits its noise level σ by empirical Bayes on unlabelled training data
+from that world, under the same train-only protocol. Planner settings stay as
+tuned in the nominal world. Success %, 50 paired episodes per cell:
+
+**narrow** (Train / Interp / High μ / Low μ / Adv)
+
+| World | PPO | PPO (DR) | Causal (textbook) | causal σ |
+|---|---|---|---|---|
+| nominal | 100 / 100 / 96 / **0** / 100 | 100 / 100 / 100 / **0** / 100 | 100 / 100 / 100 / 100 / 96 | 0.0075 |
+| stiction | 96 / 96 / 60 / **0** / 96 | 100 / 100 / 100 / **0** / 100 | **76 / 82 / 72 / 86 / 74** | 0.01 |
+| speed_friction | 88 / 100 / 12 / 0 / 0 | 100 / 100 / 100 / 0 / 100 | 100 / 100 / 100 / 100 / 100 | 0.03 |
+| actuator | 100 / 100 / 0 / 0 / 100 | 100 / 100 / 100 / 0 / 100 | 100 / 96 / 100 / 74 / 90 | 0.0075 |
+| combined | 100 / 100 / 0 / 0 / 100 | 100 / 100 / 100 / 0 / 100 | 94 / 96 / 100 / 82 / 96 | 0.015 |
+
+**pdf** (Train / Interp / High μ / Low μ / Full range)
+
+| World | PPO | PPO (DR) | Causal (textbook) | causal σ |
+|---|---|---|---|---|
+| nominal | 100 / 100 / 100 / 100 / 78 | 100 / 100 / 98 / 100 / 98 | 100 / 100 / 100 / 100 / 100 | 0.03 |
+| stiction | 100 / 100 / 84 / 100 / 80 | 100 / 100 / 70 / 100 / 96 | **94 / 90 / 80 / 98 / 82** | 0.03 |
+| speed_friction | 94 / 86 / 100 / 0 / 64 | 100 / 100 / 100 / 100 / 98 | 100 / 100 / 100 / 100 / 100 | 0.15* |
+| actuator | 98 / 100 / 100 / 100 / 80 | 100 / 100 / 98 / 100 / 100 | 100 / 100 / 94 / 100 / 96 | 0.03 |
+| combined | 100 / 100 / 98 / 100 / 78 | 100 / 100 / 100 / 100 / 90 | 100 / 100 / 94 / 100 / 100 | 0.075 |
+
+\*At the top of the σ grid. The agent scores 100% at both 0.05 and 0.15, so this
+does not matter here. (The grid was widened from a 0.05 maximum after the first
+pass hit it; the nominal values are interior and unchanged.)
+
+What it shows:
+
+- **A larger fitted σ is how the textbook agent absorbs model error.** Speed-dependent
+  friction is a smooth, monotone distortion. Treating it as extra noise
+  (σ 0.0075 → 0.03 narrow) costs nothing. The posterior widens, and the
+  agent pushes more cautiously and corrects on later steps.
+- **The actuator gain is absorbed by the mass estimate**, since F/m cannot
+  tell 0.85·F from m/0.85. The deadband is not absorbed: it costs up to 26 points
+  on narrow Low μ, where the 0.4 N deadband is half the sliding force.
+- **Stiction is the failure mode.** It breaks the model's structure. The block
+  stays put under forces the model says should move it, then slides on
+  kinetic friction once it breaks free. The agent loses 14–28 points on
+  narrow, including *in distribution*: Train 76% against 96–100% for PPO trained
+  in that world. Stiction is the one effect where a learner trained in the real
+  world beats the textbook model where both are on familiar ground.
+- **Out of distribution, the textbook agent is still the most robust single agent
+  in most worlds.** Plain PPO keeps its 0% on narrow Low μ in every world, and
+  DR-PPO keeps its light-slippery corner failure. In the combined world on
+  narrow, the causal agent is the only agent above 80% on every set. On pdf,
+  DR-PPO, trained on the test conditions, also is (lowest 90% against the causal
+  agent's 94%).
+
+**Stacking with a wrong belief about its own gripper.** The causal agent
+believes a grip force or pad friction 30% off the truth (pdf, push logs as
+above):
+
+| Belief | Drops (all sets) | Low-μ reward | Full-range reward |
+|---|---|---|---|
+| correct | 0% | 6.73 | 7.79 |
+| grip force or pad μ +30% (overconfident) | 0% | 7.39 | 7.87 |
+| grip force or pad μ −30% (underconfident) | 0% | 5.75 | 7.56 |
+| *PPO / DR-PPO, for reference* | 3% on full range | 7.92 | 7.54 |
+
+The no-slip rule sits well inside the env's actual drop limit (lost finger
+contact), so 30% overconfidence still drops nothing and even speeds the agent
+up. A 30% underestimate makes it slower, about matching PPO on full range. The
+two errors affect the friction cone identically, because only their product
+enters it.
+
 ## Known remaining weaknesses (not yet addressed)
 
-- **Model correctness:** there is no test of the causal agent with a *wrong*
-  model, for example ignoring speed-dependent friction or misjudging grip force.
+- **Model structure:** the agent has no way to notice that its model class is
+  wrong, as with stiction. A real deployment would need model checking, for
+  example posterior-predictive residuals, or a richer model class (static ≠ kinetic friction).
 - **Baseline tuning:** the PPO variants use the original PPO hyperparameters and
   uniform domain randomization. Corner oversampling, curriculum, or a recurrent
   (LSTM) policy might remove DR-PPO's corner failures. The full-history MLP gives
@@ -182,7 +267,7 @@ much slip the env tolerates.
 ## Reproducing
 
 ```
-python test_sim_physics.py                      # 21 simulator checks
+python test_sim_physics.py                      # 23 simulator checks
 python train.py --preset pdf                    # PPO
 python train.py --preset pdf --variant ppo_hist|ppo_dr|ppo_dr_hist --timesteps 1000000
 python mbrl_baseline.py --preset pdf            # model-based RL
@@ -191,4 +276,6 @@ python tune_on_train.py --preset pdf            # all planner hyperparameters (t
 python eval_causal_agent.py --preset pdf        # push comparison
 python stack_transfer.py bank|train|eval --preset pdf
 python stack_transfer.py bank --preset pdf --dr && python stack_transfer.py train --preset pdf --dr
+python train.py --preset pdf --variant ppo|ppo_dr --world stiction|speed_friction|actuator|combined
+python eval_misspecification.py push|stack --preset pdf
 ```

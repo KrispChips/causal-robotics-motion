@@ -93,9 +93,13 @@ class CausalStackPolicy:
     name = 'Causal'
 
     def __init__(self, force_max, velocity_noise_std, n_samples=512, n_candidates=18,
-                 success_reward=10.0, fail_reward=-5.0, rng=None):
+                 success_reward=10.0, fail_reward=-5.0, rng=None,
+                 finger_force=S.FINGER_FORCE, finger_mu=S.FINGER_MU):
+        """finger_force / finger_mu: what the agent BELIEVES about its own
+        gripper (defaults = the truth; the misspecification ablation varies them)."""
         from bayesian_causal_agent import BayesianCausalAgent
         self.force_max = force_max
+        self.finger_force, self.finger_mu = finger_force, finger_mu
         self.agent = BayesianCausalAgent(rng=rng or np.random.default_rng(0),
                                          force_range=(0.0, force_max),
                                          velocity_noise_std=velocity_noise_std)
@@ -116,7 +120,8 @@ class CausalStackPolicy:
 
     def predict(self, obs, deterministic=True):
         mu_s, m_s = self.infer(obs)
-        p_drop = np.array([1.0 - S.holds(mu_s, m_s, a).mean() for a in self.cands])
+        p_drop = np.array([1.0 - S.holds(mu_s, m_s, a, self.finger_force,
+                                         self.finger_mu).mean() for a in self.cands])
         exp_r = (1 - p_drop) * (self.r_succ - self.times) + p_drop * self.r_fail
         i = int(np.argmax(exp_r))
         b = self.agent.get_beliefs()
